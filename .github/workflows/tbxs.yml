@@ -46,13 +46,8 @@ jobs:
             [Tomorrow]="https://github.com/tushen6/Tomorrow.git" 
             [aa999ok]="https://github.com/AA999OK/TVBOX.git" 
             [sky4726]="https://github.com/sky4726/sk.git" 
-            [ediart]="https://github.com/ediart/tvbox.git" 
-            [lemonguo121]="https://github.com/lemonguo121/BoxRes.git" 
-            [leexuben]="https://github.com/leexuben/TVBOX-merge.git" 
-            [yjl]="https://github.com/YJL20190405/TVBOX.git" 
+            [leexuben]="https://github.com/leexuben/TVBOX-merge.git"  
             [zheng1976]="https://github.com/zheng197600/tvbox.git" 
-            [FGBLH]="https://github.com/FGBLH/FG.git" 
-            [yihad168]="https://github.com/yihad168/tv.git" 
             [cpu_iy]="https://gitee.com/cpu-iy/iy.git"
             [reF1nd]="https://github.com/syccccc2333-oss/singbox_config.git"
           ) 
@@ -68,21 +63,8 @@ jobs:
 
           echo "==== 同步完成 ====" 
 
-          find dr tvbox T4 wzxxcz ljlfct01 Tomorrow aa999ok sky4726 ediart lemonguo121 leexuben yjl zheng1976 FGBLH yihad168 cpu_iy reF1nd \
+          find dr tvbox T4 wzxxcz ljlfct01 Tomorrow aa999ok sky4726 leexuben zheng1976 yihad168 cpu_iy reF1nd \
             -type f -exec touch {} + 
-
-      - name: Download and extract NewTVBox 
-        run: | 
-          echo "==== 开始下载 GitHub 仓库 PizazzGY/NewTVBox ====" 
-          mkdir -p gitee-source && rm -rf gitee-source/* 
-          curl -L -o github.zip "https://github.com/PizazzGY/NewTVBox/archive/refs/heads/main.zip" 
-          if unzip -t github.zip >/dev/null 2>&1; then 
-            unzip -q github.zip 
-            cp -r NewTVBox-main/* gitee-source/ 
-            rm -rf NewTVBox-main github.zip 
-          else 
-            rm -f github.zip 
-          fi 
 
       - name: Commit and push to default branch 
         run: | 
