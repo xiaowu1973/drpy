@@ -5,20 +5,31 @@
 	font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif
 }
 
+html,
 body {
 	line-height: 1.5;
 	min-height: 100vh;
 	display: flex;
 	justify-content: center;
 	align-items: center;
-	padding: 15px
+	padding: 15px;
+	background-color: #d9d9d9;
+	color: #333
+}
+
+#root {
+	min-height: 100vh;
+	display: flex;
+	justify-content: center;
+	align-items: center
 }
 
 .container {
 	width: 60%;
-	background-color: #f0f0f0;
+	background-color: #ffffff;
 	padding: 30px;
 	border-radius: 15px;
+	box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
 	transition: all 0.4s ease
 }
 
@@ -31,7 +42,8 @@ h1 {
 	font-size: 2.2rem;
 	margin-bottom: 10px;
 	position: relative;
-	padding-bottom: 10px
+	padding-bottom: 10px;
+	color: #1a1a1a
 }
 
 h1::after {
@@ -42,13 +54,15 @@ h1::after {
 	transform: translateX(-50%);
 	width: 80px;
 	height: 3px;
-	border-radius: 2px
+	border-radius: 2px;
+	background-color: #999
 }
 
 .subtitle {
 	font-size: 1.1rem;
 	max-width: 600px;
-	margin: 0 auto
+	margin: 0 auto;
+	color: #555
 }
 
 .content {
@@ -64,7 +78,8 @@ h1::after {
 .sidebar {
 	flex: 1;
 	padding: 15px;
-	border-radius: 8px
+	border-radius: 8px;
+	background-color: #e8e8e8
 }
 
 p {
@@ -102,7 +117,9 @@ a {
 	display: flex;
 	align-items: center;
 	justify-content: center;
-	gap: 8px
+	gap: 8px;
+	background-color: #e0e0e0;
+	color: #444
 }
 
 .device-info i {
@@ -120,16 +137,19 @@ a {
 	border-radius: 8px;
 	text-align: center;
 	flex: 1;
-	transition: transform 0.3s ease
+	transition: transform 0.3s ease;
+	background-color: #f0f0f0
 }
 
 .feature-card:hover {
-	transform: translateY(-3px)
+	transform: translateY(-3px);
+	box-shadow: 0 6px 16px rgba(0, 0, 0, 0.1)
 }
 
 .feature-card i {
 	font-size: 2.2rem;
-	margin-bottom: 12px
+	margin-bottom: 12px;
+	color: #555
 }
 
 @media (max-width:1024px) {
@@ -192,7 +212,8 @@ a {
 
 @media (max-width:640px) {
 	body {
-		background-color: #f0f0f0
+		background-color: #d9d9d9;
+		padding: 0
 	}
 
 	.container {

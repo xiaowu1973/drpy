@@ -1,0 +1,220 @@
+
+
+<snow>
+<!-- 导演手记：
+[场景类型] 纸质与书写类·天子御案暗阁日记
+[UI设定] 风格关键词：古风泥金宣纸、残墨、古朴焦痕、微黄陈卷 配色：#f4ece1, #3c2f2f, #8b263e, #d4af37
+[视觉策略] CSS原生绘图（模拟宣纸纹理、焦黑撕边、火漆封印与朱砂批注）
+[交互逻辑]
+- 核心功能：点击翻动散落的御题断简；点击火盆触发“焚诗”模拟与火星粒子效果
+- 交互细节：按钮点击微缩反馈，毛笔字迹淡入淡出，状态机控制“展卷-批注-封存”
+[绝对中文语言] 使用简体中文为核心语言创造小剧场
+-->
+<details>
+<summary>⋯♡⋯📜 极光剧场：御案残简·未焚之诗 ⋯♡⋯</summary>
+<p style="text-align: center;font-size: 0.8em;font-style: italic">“有些字写下来，只合见火，不合见人。”</p>
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body {
+background: transparent;
+margin: 0;
+padding: 10px;
+overflow: auto;
+height: auto;
+font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", serif;
+}
+.container {
+max-width: 580px;
+margin: 0 auto;
+background: #f7f1e5;
+border: 2px solid #c8b99c;
+box-shadow: 0 8px 24px rgba(60, 47, 47, 0.15);
+border-radius: 4px;
+padding: 24px 20px;
+position: relative;
+box-sizing: border-box;
+scrollbar-width: none;
+}
+.container::-webkit-scrollbar {
+display: none;
+}
+.title-custom {
+margin: 0 0 16px 0;
+text-align: center;
+font-size: 18px;
+font-weight: bold;
+color: #3c2f2f;
+letter-spacing: 2px;
+border-bottom: 1px dashed #d1c4aa;
+padding-bottom: 8px;
+}
+.desk-mat {
+background: #ede3ce;
+border: 1px solid #d8caa9;
+padding: 16px;
+border-radius: 2px;
+position: relative;
+}
+.poem-paper {
+background: #faf6ee;
+border-left: 3px solid #8b263e;
+padding: 16px 18px;
+margin-bottom: 16px;
+position: relative;
+box-shadow: 1px 2px 6px rgba(0,0,0,0.05);
+}
+.poem-line {
+font-size: 15px;
+color: #2b2b2b;
+line-height: 1.8;
+margin: 4px 0;
+letter-spacing: 1px;
+}
+.imperial-note {
+margin-top: 12px;
+font-size: 12px;
+color: #8b263e;
+border-top: 1px dotted #e2d3b5;
+padding-top: 8px;
+line-height: 1.5;
+}
+.seal-mark {
+position: absolute;
+right: 12px;
+bottom: 12px;
+width: 44px;
+height: 44px;
+border: 2px solid #8b263e;
+color: #8b263e;
+font-size: 11px;
+display: flex;
+align-items: center;
+justify-content: center;
+text-align: center;
+line-height: 1.1;
+transform: rotate(-8deg);
+opacity: 0.75;
+user-select: none;
+border-radius: 2px;
+}
+.action-bar {
+display: flex;
+gap: 10px;
+justify-content: center;
+margin-top: 16px;
+}
+.btn-action {
+background: #3c2f2f;
+color: #f7f1e5;
+border: none;
+padding: 8px 16px;
+font-size: 13px;
+cursor: pointer;
+border-radius: 2px;
+letter-spacing: 1px;
+outline: none;
+}
+.btn-action:active {
+transform: scale(0.95);
+}
+.btn-burn {
+background: #8b263e;
+}
+.hidden-box {
+display: none;
+}
+.burned-state {
+text-align: center;
+padding: 24px 10px;
+color: #7a6e65;
+font-style: italic;
+font-size: 13px;
+border: 1px dashed #b5a490;
+background: #f0e7d5;
+}
+</style>
+</head>
+<body>
+<div class="container">
+<p class="title-custom">乾明宫·御案夹层断简</p>
+<div class="desk-mat">
+<div id="paperNormal" class="poem-paper">
+<div class="poem-line">阶前新白压枝低，</div>
+<div class="poem-line">偶向幽禽借一枝。</div>
+<div class="poem-line">莫道韶华容易老，</div>
+<div class="poem-line">深宫犹有未题诗。</div>
+<div class="imperial-note">
+朱批杂记：五月十一，慈宁宫折花。彼言“浮生若寄”，声甚细，如冷玉堕水。字迹草草，心绪杂乱，不可令外臣观。
+</div>
+<div class="seal-mark">御览<br>之宝</div>
+</div>
+
+<div id="paperBurned" class="burned-state hidden-box">
+纸页已投铜炉。余烬蜷曲焦黑，火星暗灭，惟余一缕淡青烟气。<br>
+（元宝悄声入内，换下一盏残茶，低头装作未见。）
+</div>
+
+<div class="action-bar">
+<button id="btnRead" class="btn-action">翻捡残简</button>
+<button id="btnBurn" class="btn-action btn-burn">投炉销毁</button>
+</div>
+</div>
+</div>
+
+<script>
+(function(){
+var state = 0;
+var poems = [
+{
+lines: ["阶前新白压枝低，", "偶向幽禽借一枝。", "莫道韶华容易老，", "深宫犹有未题诗。"],
+note: "朱批杂记：五月十一，慈宁宫折花。彼言“浮生若寄”，声甚细，如冷玉堕水。字迹草草，心绪杂乱，不可令外臣观。"
+},
+{
+lines: ["庭前叶落又一秋，", "少年心事白了头。", "欲将笔墨问归处，", "恐被人知笑不休。"],
+note: "旧简：永平七年秋夜批折毕书。酸腐文士之态，殊无帝王气象，当毁。"
+},
+{
+lines: ["梦里不知身是客，", "醒来犹在帝王家。", "若问平生何所愿，", "寻常巷陌一瓯茶。"],
+note: "旧简：永平九年春夜。此语大逆，若落御史台中丞之耳，恐生大波。"
+}
+];
+
+var pNormal = document.getElementById('paperNormal');
+var pBurned = document.getElementById('paperBurned');
+var btnRead = document.getElementById('btnRead');
+var btnBurn = document.getElementById('btnBurn');
+
+function renderPoem(idx) {
+pNormal.classList.remove('hidden-box');
+pBurned.classList.add('hidden-box');
+var item = poems[idx];
+var html = '';
+for(var i=0; i<item.lines.length; i++) {
+html += '<div class="poem-line">' + item.lines[i] + '</div>';
+}
+html += '<div class="imperial-note">' + item.note + '</div>';
+html += '<div class="seal-mark">御览<br>之宝</div>';
+pNormal.innerHTML = html;
+}
+
+btnRead.onclick = function() {
+state = (state + 1) % poems.length;
+renderPoem(state);
+};
+
+btnBurn.onclick = function() {
+pNormal.classList.add('hidden-box');
+pBurned.classList.remove('hidden-box');
+};
+})();
+</script>
+</body>
+</html>
+```
+</details>
+</snow>
