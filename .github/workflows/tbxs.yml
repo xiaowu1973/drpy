@@ -38,7 +38,7 @@ jobs:
         run: | 
           echo "==== 开始同步仓库 ====" 
           declare -A repos=( 
-            [NewTVBox]"https://github.com/FourDSpace/NewTVBox.git"
+            [NewTVBox]="https://github.com/FourDSpace/NewTVBox.git"
             [dr]="https://github.com/jak0099/dr.git" 
             [tvbox]="https://github.com/cluntop/tvbox.git" 
             [T4]="https://github.com/4TVBox/TVBox.git" 
