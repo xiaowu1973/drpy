@@ -6,24 +6,31 @@
   "dns": {
     "servers": [
       {
-        "type": "https",
         "tag": "remote",
-        "server": "8.8.8.8",
+        "address": "https://8.8.8.8/dns-query",
+	"strategy": "prefer_ipv4",
         "detour": "select"
       },
       {
-        "type": "https",
         "tag": "local",
-        "server": "223.5.5.5"
+        "address": "https://223.5.5.5/dns-query",
+	"strategy": "prefer_ipv4",
+        "detour": "direct"
       },
       {
-        "type": "fakeip",
+        "tag": "block",
+        "address": "rcode://success"
+      },
+      {
         "tag": "fakeip",
-        "inet4_range": "198.18.0.0/15",
-        "inet6_range": "fc00::/18"
+        "address": "fakeip"
       }
     ],
     "rules": [
+      {
+        "outbound": ["any"],
+        "server": "local"
+      },
       {
         "clash_mode": "Global",
         "server": "remote"
@@ -31,16 +38,13 @@
       {
         "clash_mode": "Direct",
         "server": "local"
-      },
-      {
-        "query_type": [
-          "A",
-          "AAAA"
-        ],
-        "server": "fakeip",
-        "rewrite_ttl": 1
       }
     ],
+    "fakeip": {
+      "enabled": true,
+      "inet4_range": "198.18.0.0/15",
+      "inet6_range": "fc00::/18"
+    },
     "strategy": "prefer_ipv4",
     "independent_cache": true,
     "reverse_mapping": true
@@ -51,7 +55,10 @@
       "tag": "mixed-in",
       "listen": "0.0.0.0",
       "listen_port": 10172,
-      "tcp_fast_open": true,
+      "tcp_fast_open":true,
+      "sniff": false,
+      "sniff_override_destination": false,
+      "domain_strategy": "prefer_ipv4",
       "set_system_proxy": false
     },
     {
@@ -59,14 +66,20 @@
       "tag": "socks-in",
       "listen": "0.0.0.0",
       "listen_port": 10173,
-      "tcp_fast_open": true
+      "tcp_fast_open":true,
+      "sniff": false,
+      "sniff_override_destination": false,
+      "domain_strategy": "prefer_ipv4"
     },
     {
       "type": "mixed",
       "tag": "mixed-in2",
       "listen": "0.0.0.0",
       "listen_port": 10174,
-      "tcp_fast_open": true,
+      "tcp_fast_open":true,
+      "sniff": false,
+      "sniff_override_destination": false,
+      "domain_strategy": "prefer_ipv4",
       "set_system_proxy": false
     },
     {
@@ -74,23 +87,10 @@
       "tag": "mixed-in3",
       "listen": "0.0.0.0",
       "listen_port": 10175,
-      "tcp_fast_open": true,
-      "set_system_proxy": false
-    },
-    {
-      "type": "mixed",
-      "tag": "mixed-in4",
-      "listen": "0.0.0.0",
-      "listen_port": 10176,
-      "tcp_fast_open": true,
-      "set_system_proxy": false
-    },
-    {
-      "type": "mixed",
-      "tag": "mixed-in5",
-      "listen": "0.0.0.0",
-      "listen_port": 10177,
-      "tcp_fast_open": true,
+      "tcp_fast_open":true,
+      "sniff": false,
+      "sniff_override_destination": false,
+      "domain_strategy": "prefer_ipv4",
       "set_system_proxy": false
     }
   ],
@@ -101,27 +101,31 @@
       "outbounds": [
         "urltest"
       ],
-      "default": "urltest",
-      "interrupt_exist_connections": true
+      "default": "urltest"
     },
     {
       "type": "urltest",
       "tag": "urltest",
       "interval": "30m",
       "idle_timeout": "60m",
-      "interrupt_exist_connections": true,
+      "interrupt_exist_connections": false,
       "outbounds": null
     },
     {
       "type": "direct",
       "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "dns",
+      "tag": "dns-out"
     }
   ],
   "route": {
     "rules": [
-      {
-        "action": "sniff"
-      },
       {
         "type": "logical",
         "mode": "or",
@@ -133,47 +137,23 @@
             "port": 53
           }
         ],
-        "action": "hijack-dns"
-      },
-      {
-        "inbound": [
-          "mixed-in",
-          "socks-in",
-          "mixed-in2",
-          "mixed-in3",
-          "mixed-in4",
-          "mixed-in5"
-        ],
-        "action": "resolve",
-        "strategy": "prefer_ipv4"
+        "outbound": "dns-out"
       },
       {
         "ip_is_private": true,
         "outbound": "direct"
       },
       {
-        "inbound": [
-          "mixed-in2"
-        ],
-        "outbound": "select2"
+	      "inbound":[
+		      "mixed-in2"
+	      ],
+	      "outbound":"select2"
       },
       {
-        "inbound": [
-          "mixed-in3"
-        ],
-        "outbound": "select3"
-      },
-      {
-        "inbound": [
-          "mixed-in4"
-        ],
-        "outbound": "select4"
-      },
-      {
-        "inbound": [
-          "mixed-in5"
-        ],
-        "outbound": "select5"
+	      "inbound":[
+		      "mixed-in3"
+	      ],
+	      "outbound":"select3"
       },
       {
         "clash_mode": "Direct",
@@ -198,14 +178,10 @@
             "protocol": "stun"
           }
         ],
-        "action": "reject"
+        "outbound": "block"
       }
     ],
-    "auto_detect_interface": false,
-    "default_domain_resolver": {
-      "server": "local",
-      "strategy": "prefer_ipv4"
-    }
+    "auto_detect_interface": false
   },
   "experimental": {
     "cache_file": {
@@ -214,7 +190,11 @@
     },
     "clash_api": {
       "external_controller": "0.0.0.0:19090",
+      "external_ui": "ui",
+      "external_ui_download_url": "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
+      "external_ui_download_detour": "select",
       "default_mode": "Rule"
     }
   }
 }
+
