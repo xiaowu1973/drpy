@@ -40,8 +40,7 @@ jobs:
           declare -A repos=( 
             [NewTVBox]="https://github.com/FourDSpace/NewTVBox.git"
             [kjh998]="https://github.com/phu889/kjh998.git"
-            [dr]="https://github.com/jak0099/dr.git"
-            [tvbox]="https://github.com/cluntop/tvbox.git" 
+            [dr]="https://github.com/jak0099/dr.git" 
             [jiemi]="https://github.com/woshishiq1/jiemi.git"
             [tvbox]="https://github.com/qist/tvbox.git"
             [T4]="https://github.com/4TVBox/TVBox.git"
@@ -54,8 +53,7 @@ jobs:
             [leexuben]="https://github.com/leexuben/TVBOX-merge.git" 
             [yjl]="https://github.com/YJL20190405/TVBOX.git" 
             [zheng1976]="https://github.com/zheng197600/tvbox.git" 
-            [FGBLH]="https://github.com/FGBLH/FG.git" 
-            [yihad168]="https://github.com/yihad168/tv.git" 
+            [FGBLH]="https://github.com/FGBLH/FG.git"  
             [cpu_iy]="https://gitee.com/cpu-iy/iy.git" 
             [cpu_iy2]="https://gitee.com/cpu-iy/lib.git" 
             [reF1nd]="https://github.com/syccccc2333-oss/singbox_config.git" 
@@ -98,7 +96,7 @@ jobs:
  
       - name: Fix timestamps（安全版） 
         run: | 
-          dirs="NewTVBox kjh998 dr tvbox jiemi tvbox T4 wzxxcz Tomorrow aa999ok sky4726 ediart lemonguo121 leexuben yjl zheng1976 FGBLH yihad168 cpu_iy cpu_iy2 reF1nd bd catvod jaychouqq _posts loleis Ye-11X115490 wanganni ycc1195835265 zhangfdzr 666tv tenrecha" 
+          dirs="NewTVBox kjh998 dr jiemi tvbox T4 wzxxcz Tomorrow aa999ok sky4726 ediart lemonguo121 leexuben yjl zheng1976 FGBLH cpu_iy cpu_iy2 reF1nd bd catvod jaychouqq _posts loleis Ye-11X115490 wanganni ycc1195835265 zhangfdzr 666tv tenrecha" 
  
           for d in $dirs; do 
             [ -d "$d" ] || continue 
