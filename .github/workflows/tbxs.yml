@@ -39,7 +39,7 @@ jobs:
           echo "==== 开始同步仓库 ====" 
           declare -A repos=( 
             [NewTVBox]="https://github.com/FourDSpace/NewTVBox.git"
-            [kjh998]="https://github.com/phu889/kjh998.git"
+            [天神IY]="https://github.com/woshishiq1/tvbox.git"
             [dr]="https://github.com/jak0099/dr.git" 
             [jiemi]="https://github.com/woshishiq1/jiemi.git"
             [tvbox]="https://github.com/qist/tvbox.git"
@@ -94,7 +94,7 @@ jobs:
  
       - name: Fix timestamps（安全版） 
         run: | 
-          dirs="NewTVBox kjh998 dr jiemi tvbox T4 wzxxcz Tomorrow aa999ok sky4726 ediart lemonguo121 leexuben yjl zheng1976 cpu_iy cpu_iy2 reF1nd bd catvod jaychouqq _posts loleis Ye-11X115490 wanganni ycc1195835265 zhangfdzr 666tv tenrecha" 
+          dirs="NewTVBox 天神IY dr jiemi tvbox T4 wzxxcz Tomorrow aa999ok sky4726 ediart lemonguo121 leexuben yjl zheng1976 cpu_iy cpu_iy2 reF1nd bd catvod jaychouqq _posts loleis Ye-11X115490 wanganni ycc1195835265 zhangfdzr 666tv tenrecha" 
  
           for d in $dirs; do 
             [ -d "$d" ] || continue 
