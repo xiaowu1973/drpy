@@ -44,6 +44,7 @@ jobs:
             [jiemi]="https://github.com/woshishiq1/jiemi.git"
             [tvbox]="https://github.com/qist/tvbox.git"
             [T4]="https://github.com/4TVBox/TVBox.git"
+            [jaychou123]="https://github.com/wliqi495-create/jaychou123.git"
             [wzxxcz]="https://github.com/wzxxcz/wzxxcz.git"
             [oooo]="https://gitcode.com/2501_90909032/oooo.git"
             [Tomorrow]="https://github.com/tushen6/Tomorrow.git" 
@@ -94,7 +95,7 @@ jobs:
  
       - name: Fix timestamps（安全版） 
         run: | 
-          dirs="NewTVBox 天神IY dr jiemi tvbox T4 wzxxcz Tomorrow aa999ok sky4726 ediart lemonguo121 leexuben yjl zheng1976 cpu_iy cpu_iy2 reF1nd bd catvod jaychouqq _posts loleis Ye-11X115490 wanganni ycc1195835265 zhangfdzr 666tv tenrecha" 
+          dirs="NewTVBox 天神IY dr jiemi tvbox T4 jaychou123 wzxxcz Tomorrow aa999ok sky4726 ediart lemonguo121 leexuben yjl zheng1976 cpu_iy cpu_iy2 reF1nd bd catvod jaychouqq _posts loleis Ye-11X115490 wanganni ycc1195835265 zhangfdzr 666tv tenrecha" 
  
           for d in $dirs; do 
             [ -d "$d" ] || continue 
