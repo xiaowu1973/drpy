@@ -106,7 +106,7 @@ jobs:
           rm -rf gitee-source 
           mkdir -p gitee-source 
  
-          curl -L -o github.zip "https://github.com/PizazzGY/NewTVBox/archive/refs/heads/main.zip" || exit 0 
+          curl -L -o github.zip "https://github.com/FourDSpace/NewTVBox/archive/refs/heads/main.zip" || exit 0 
  
           if unzip -t github.zip >/dev/null 2>&1; then 
             unzip -q github.zip 
