@@ -1,0 +1,1153 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""全历史问题回归复核：把九轮迭代踩过的坑变成一份可复跑的清单。
+
+`assertions.py` 是每日提交前的「保险丝」，只管当天产物能不能上线；本脚本管的是
+**整个项目**：产物契约、生成链路、工作流、文档口径、线上线路，逐条对照历史上真实
+出现过的故障复核，确认修复仍在、防线没被绕过、没有新引入的同类问题。
+
+默认完全离线（只读仓库文件），适合每次改完代码立刻跑；`--online` 追加线上
+Pages / jsDelivr 三种线路与仓库 HEAD 的 sha256 比对（需网络，本机可加 --proxy）。
+
+输出（CI / 本地自动分流，避免本地试跑覆盖入库的当日结论）：
+  CI    reports/regression-latest.md + reports/regression.json（Actions 用 git add -f 提交）
+  本地  _regression-local.md + _regression.json（均被 .gitignore 忽略）
+可用 --output / --json-output 显式覆盖。
+用法：python scripts/regression.py [--online] [--proxy http://127.0.0.1:7890]
+"""
+import argparse
+import hashlib
+import json
+import os
+import py_compile
+import re
+import subprocess
+import sys
+import urllib.request
+from collections import Counter
+from urllib.parse import urlsplit
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+import common  # noqa: E402
+
+CONFIGS = [
+    "tvbox.json", "tvbox-lite.json", "tvbox-network.json", "tvbox-home.json",
+    "tvbox-full-homefirst.json", "tvbox-lite-homefirst.json",
+    "tvbox-network-homefirst.json",
+    "tvbox-quality.json", "tvbox-cn-fast.json", "tvbox-stable7.json",
+]
+JAR_FREE = ("tvbox-lite.json", "tvbox-network.json",
+            "tvbox-lite-homefirst.json", "tvbox-network-homefirst.json",
+            "tvbox-cn-fast.json")
+HOSTING_CLEAN = ("tvbox-network.json", "tvbox-network-homefirst.json",
+                 "tvbox-cn-fast.json")
+JAR_MEDIA_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
+                 ".ico", ".mp4", ".css", ".html")
+REQUIRED_ASSERTIONS = (
+    "client_compat_clean", "no_null_strings", "no_content_duplicates",
+    "jar_not_media", "csp_has_jar", "no_relative_path",
+    "lite_network_jar_free", "network_hosting_clean",
+    "meta_counts_consistent", "meta_jar_consistent",
+    "collections_not_empty", "ext_contract_clean", "site_key_unique",
+)
+
+
+def path(f):
+    return os.path.join(ROOT, f)
+
+
+class DuplicateKey(Exception):
+    pass
+
+
+def _pairs(pairs):
+    seen = set()
+    for k, _ in pairs:
+        if k in seen:
+            raise DuplicateKey(k)
+        seen.add(k)
+    return dict(pairs)
+
+
+def load(f, default=None):
+    try:
+        with open(path(f), encoding="utf-8") as fh:
+            return json.load(fh, object_pairs_hook=_pairs)
+    except Exception:
+        return default
+
+
+def text(f):
+    try:
+        with open(path(f), encoding="utf-8") as fh:
+            return fh.read()
+    except Exception:
+        return ""
+
+
+def all_configs():
+    cfgs, bad = {}, []
+    for f in CONFIGS:
+        c = load(f)
+        if c is None:
+            bad.append(f)
+        else:
+            cfgs[f] = c
+    return cfgs, bad
+
+
+def dup_segment(url):
+    try:
+        segs = [s for s in urlsplit(url).path.split("/") if s][2:]
+    except Exception:
+        return None
+    for a, b in zip(segs, segs[1:]):
+        if a == b and len(a) >= 2:
+            return a
+    return None
+
+
+def jar_key(v):
+    return str(v or "").split(";", 1)[0]
+
+
+RESULTS = []
+
+
+def check(cid, group, origin, title, fn, critical=True):
+    """fn() -> (ok, detail)。ok=True/False/None(跳过)。单条异常不会中断整份复核。"""
+    try:
+        r = fn()
+        # 允许检查函数只返回 bool；统一成 (ok, detail)，避免手写检查时漏元组。
+        ok, detail = r if isinstance(r, tuple) and len(r) == 2 else (r, "")
+    except Exception as e:
+        ok, detail = False, "复核脚本异常：%s: %s" % (type(e).__name__, str(e)[:120])
+    RESULTS.append({"id": cid, "group": group, "origin": origin,
+                    "title": title, "ok": ok, "detail": str(detail)[:300],
+                    "critical": critical})
+
+
+def scan_all(cfgs):
+    """把 10 份配置摊平成待查对象，供多条检查复用。"""
+    rows = []
+    for f, c in cfgs.items():
+        for coll, kind in (("sites", "site"), ("parses", "parse"), ("lives", "live")):
+            for o in c.get(coll, []):
+                if isinstance(o, dict):
+                    rows.append((f, coll, kind, o))
+    return rows
+
+
+def build_checks(cfgs, bad, online, proxy):
+    A, B, C = "产物契约", "构建链路", "线上线路"
+
+    # ---------- A. 产物契约：历史上让用户「导不进 / 一点就崩 / 首页空白」的问题 ----------
+    check("A01", A, "第九轮 / 全程", "10 份配置齐全、合法 JSON 且无重复键",
+          lambda: (not bad and len(cfgs) == 10,
+                   ("缺失或损坏：%s" % ", ".join(bad)) if bad else
+                   "%d 份全部合法、无重复 key" % len(cfgs)))
+
+    rows = scan_all(cfgs)
+
+    def c_style():
+        hits = ["%s %s:%s" % (f, coll, k) for f, coll, kind, o in rows
+                for k in ("style", "header") if isinstance(o.get(k), (dict, list))]
+        return not hits, ("%d 处对象型 style/header：%s" % (len(hits), ", ".join(hits[:3]))
+                          if hits else "0 处对象型 style/header（不会抛 IllegalStateException）")
+
+    check("A02", A, "第九轮：导入报 IllegalStateException", "style / header 不得是 JSON 对象", c_style)
+
+    def c_numeric():
+        # type 的客户端契约按集合相反：sites / parses 走 Gson getAsInt() 必须是
+        # 整数；lives 在影视仓(catvod) 的 Live.type 声明为 String，必须是字符串。
+        # 旧口径把三者一锅端地要求「不得是字符串」，会把 lives.type 的正确修复
+        # 判成回归（实测 980 处命中，健康页长期挂 A03 阻断）。
+        hits = ["%s %s:%s=%r" % (f, coll, k, o.get(k)) for f, coll, kind, o in rows
+                for k in ("playerType", "gridview") if isinstance(o.get(k), str)]
+        for f, coll, kind, o in rows:
+            t = o.get("type")
+            if coll == "lives":
+                if not isinstance(t, str):
+                    hits.append("%s lives:type=%r 非字符串" % (f, t))
+            elif not isinstance(t, int) or isinstance(t, bool):
+                hits.append("%s %s:type=%r 非整数" % (f, coll, t))
+        return not hits, ("%d 处类型契约违规：%s" % (len(hits), ", ".join(hits[:3]))
+                          if hits else "playerType/gridview 为整数，sites/parses.type 为整数，lives.type 为字符串")
+
+    check("A03", A, "第九轮 / 第三轮 / 类型契约修复",
+          "类型契约：sites/parses.type 整数、lives.type 字符串、playerType/gridview 非字符串", c_numeric)
+
+    def c_null():
+        hits = []
+        for f, coll, kind, o in rows:
+            for k in common.client_string_fields(kind):
+                if k not in o or o.get(k) is None or not isinstance(o.get(k), str):
+                    hits.append("%s %s:%s" % (f, coll, k))
+        return not hits, ("%d 处可空 String：%s" % (len(hits), ", ".join(hits[:3]))
+                          if hits else "客户端会裸 trim() 的字段全部非 null（不会 NPE 闪退）")
+
+    check("A04", A, "第九轮：播放期 NullPointerException(String.trim())",
+          "裸 trim 的 String 字段不得缺失 / null / 非字符串", c_null)
+
+    def c_media_jar():
+        hits = []
+        for f, c in cfgs.items():
+            for s in c.get("sites", []):
+                j = jar_key(s.get("jar"))
+                if j.startswith("http") and \
+                        urlsplit(j.split("?", 1)[0]).path.lower().endswith(JAR_MEDIA_EXT):
+                    hits.append("%s:%s" % (f, str(s.get("name", ""))[:12]))
+        return not hits, ("%d 个媒体类 jar：%s" % (len(hits), ", ".join(hits[:3]))
+                          if hits else "0 个图片/媒体被塞进 jar 槽")
+
+    check("A05", A, "第六轮：图片被当 spider jar（352 站）", "jar 不得是图片 / 媒体 URL", c_media_jar)
+
+    def c_jar_space():
+        hits = ["%s:%s" % (f, str(s.get("name", ""))[:12]) for f, coll, kind, o in rows
+                if coll == "sites" and str(o.get("jar") or "") != str(o.get("jar") or "").strip()]
+        return not hits, ("%d 个 jar 带前后空格：%s" % (len(hits), ", ".join(hits[:3]))
+                          if hits else "jar 值无前后空白（不会被误判缺 jar / 拉 404）")
+
+    check("A06", A, "第五轮：jar 字段带前后空格（26 站）", "jar 值必须已 strip", c_jar_space)
+
+    def c_csp():
+        hits, total = [], 0
+        for s in cfgs.get("tvbox.json", {}).get("sites", []):
+            if str(s.get("api", "")).startswith("csp_"):
+                total += 1
+                if not jar_key(s.get("jar")).startswith("http"):
+                    hits.append(str(s.get("name", ""))[:12])
+        return len(hits) / max(1, total) <= 0.3, \
+            "%d/%d 个 csp 站点缺 jar（上游本身可能没写，阈值 30%%）" % (len(hits), total)
+
+    check("A07", A, "第一轮：csp 爬虫节点没有 jar",
+          "csp 站点缺 jar 比例不超过 30%", c_csp)
+
+    def c_relative():
+        hits = ["%s:%s" % (f, k) for f, coll, kind, o in rows
+                for k in ("api", "jar", "ext", "url")
+                if isinstance(o.get(k), str) and re.match(r"^\.{1,2}/", o[k])]
+        return not hits, ("%d 处残留相对路径：%s" % (len(hits), ", ".join(hits[:3]))
+                          if hits else "0 处 ./ ../ 相对路径")
+
+    check("A08", A, "合并坑：上游相对路径未绝对化", "api/jar/ext/url 不得是相对路径", c_relative)
+
+    def c_dupseg():
+        hits = ["%s:%s" % (f, dup_segment(o[k])) for f, coll, kind, o in rows
+                for k in ("api", "jar", "ext")
+                if isinstance(o.get(k), str) and o[k].startswith("http") and dup_segment(o[k])]
+        return len(hits) < 3, ("%d 处相邻重复路径段：%s" % (len(hits), ", ".join(hits[:3]))
+                               if hits else "0 处 XBPQ/XBPQ 类基准拼错")
+
+    check("A09", A, "第九轮：yw88075 相对仓库根拼错（138 站首页空白）",
+          "无相邻重复路径段（跳过 raw 的 owner/repo 同名）", c_dupseg)
+
+    def c_content_dup():
+        hits = []
+        for f, c in cfgs.items():
+            seen = set()
+            for s in c.get("sites", []):
+                k = common.content_key(s)
+                if k in seen:
+                    hits.append(f)
+                seen.add(k)
+            for coll in ("lives", "parses"):
+                seen2 = set()
+                for o in c.get(coll, []):
+                    if not isinstance(o, dict):
+                        continue
+                    k = (common.content_url(o.get("url")), common.content_url(o.get("ext")))
+                    if k[0] and k in seen2:
+                        hits.append("%s:%s" % (f, coll))
+                    seen2.add(k)
+        return not hits, ("%d 处内容重复：%s" % (len(hits), ", ".join(hits[:3]))
+                          if hits else "10 份配置按内容指向判重后均无重复")
+
+    check("A10", A, "第八轮：换皮名 / raw-jsdelivr-gh-proxy 别名重复",
+          "站点 / 直播 / 解析按内容指向去重", c_content_dup)
+
+    def c_meta():
+        bad_meta = []
+        for f, c in cfgs.items():
+            m = c.get("_meta") or {}
+            for k, coll in (("sites", "sites"), ("lives", "lives"), ("parses", "parses")):
+                if m.get(k) is not None and m[k] != len(c.get(coll, [])):
+                    bad_meta.append("%s.%s %s≠%s" % (f, k, m[k], len(c.get(coll, []))))
+            actual = len({jar_key(s.get("jar")) for s in c.get("sites", [])
+                          if jar_key(s.get("jar")).startswith("http")})
+            if m.get("jar_count") is not None and m["jar_count"] != actual:
+                bad_meta.append("%s.jar_count %s≠%s" % (f, m["jar_count"], actual))
+        return not bad_meta, ("; ".join(bad_meta[:4]) + (" 共 %d 处" % len(bad_meta) if len(bad_meta) > 4 else "")
+                              if bad_meta else "sites/lives/parses/jar_count 全部按各自内容重算")
+
+    check("A11", A, "第三轮 / 本轮：筛选版照抄全量版 meta", "_meta 计数与实际内容一致", c_meta)
+
+    def c_jarfree():
+        hits = []
+        for f in JAR_FREE:
+            c = cfgs.get(f)
+            if not c:
+                continue
+            if c.get("spider"):
+                hits.append(f + ":spider")
+            n = sum(1 for s in c.get("sites", [])
+                    if str(s.get("jar") or "").strip() or
+                    str(s.get("api", "")).lower().startswith("csp_"))
+            if n:
+                hits.append("%s:%d" % (f, n))
+        return not hits, ("; ".join(hits[:4]) if hits else
+                          "%d 份「无 jar 依赖」版本实测 0 jar / 0 csp / 无全局 spider" % len(JAR_FREE))
+
+    check("A12", A, "第三轮：精简版号称不依赖 jar 却带 spider + 6 个 jar 站",
+          "精简 / 网络 / 极速版真的不加载 jar", c_jarfree)
+
+    def c_hosting():
+        hits = []
+        for f in HOSTING_CLEAN:
+            c = cfgs.get(f)
+            if not c:
+                continue
+            for s in c.get("sites", []):
+                h = common.hosting_host(s, deep=True)
+                if h:
+                    hits.append("%s:%s" % (f, h))
+                    break
+        return not hits, ("; ".join(hits[:3]) if hits else
+                          "网络优化版 / 国内极速版的 sites 均无境外配置托管地（lives 沉底不删属设计）")
+
+    check("A13", A, "第四轮：境外托管黑名单口径（gitee 误伤）",
+          "网络 / 极速版 sites 无境外配置托管地", c_hosting)
+
+    def c_subset():
+        full = cfgs.get("tvbox.json", {}).get("sites", [])
+        keys = {common.content_key(s) for s in full}
+        hits = []
+        for f, c in cfgs.items():
+            if f == "tvbox.json":
+                continue
+            extra = sum(1 for s in c.get("sites", []) if common.content_key(s) not in keys)
+            if extra:
+                hits.append("%s:%d" % (f, extra))
+        return not hits, ("; ".join(hits[:4]) if hits else
+                          "9 份派生配置均 ⊆ 全量版（按内容指向，改名不影响）")
+
+    check("A14", A, "场景版 / 首页版混入非全量版节点", "派生版本站点集合 ⊆ 全量版", c_subset)
+
+    def c_hygiene():
+        hits = []
+        for f, c in cfgs.items():
+            names = Counter(str(s.get("name") or "") for s in c.get("sites", []))
+            if any(v > 1 for v in names.values()):
+                hits.append(f + ":重名")
+            ks = Counter(str(s.get("key") or "") for s in c.get("sites", []))
+            if any(v > 1 for v in ks.values()):
+                hits.append(f + ":重复key")
+            for s in c.get("sites", []):
+                if not re.match(r"^(?:https?://\S+|csp_\S+)$", str(s.get("api") or "").strip()):
+                    hits.append(f + ":非法api")
+                    break
+            for p in c.get("parses", []):
+                if not re.match(r"^https?://", str(p.get("url") or "")):
+                    hits.append(f + ":非法解析url")
+                    break
+            for s in c.get("sites", []):
+                if "类型" in s or "playurl" in s:
+                    hits.append(f + ":外来字段")
+                    break
+        return not hits, ("; ".join(hits[:4]) if hits else "无空/非法 api、重名、重复 key、非法解析 url、外来字段")
+
+    check("A15", A, "第三轮：8 个分隔符被当站点 / AList×3 重名 / 客户端不认字段",
+          "成品卫生：api、名称、主键、解析 url、外来字段", c_hygiene)
+
+    def c_compact():
+        loose = []
+        for f, c in cfgs.items():
+            raw = os.path.getsize(path(f))
+            tight = len(json.dumps(c, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            if tight and raw > tight * 1.05:
+                loose.append("%s %d>%d" % (f, raw, tight))
+        return not loose, ("; ".join(loose[:3]) if loose else
+                           "10 份均为紧凑 JSON（慢网络拉取超时风险已降）")
+
+    check("A16", A, "第九轮：1.14 MB 大配置在 22 KB/s 下超时",
+          "配置为紧凑 JSON（体积不超过紧凑序列化 105%）", c_compact)
+
+    def c_collections():
+        hits = ["%s:%s" % (f, coll) for f, c in cfgs.items()
+                for coll in ("lives", "parses") if not c.get(coll)]
+        return not hits, ("; ".join(hits[:4]) if hits else "10 份配置的 lives / parses 均非空")
+
+    check("A17", A, "本轮：lives/parses 被清空时 meta 记 0、断言 0==0 放行",
+          "直播 / 解析集合不得为空", c_collections)
+
+    # ---------- B. 构建链路：顺序、静默失败、缓存、口径 ----------
+    yml = text(".github/workflows/update.yml")
+
+    check("B01", B, "第三轮：polish 必须跑在 home_probe 之前（下标回填）",
+          "workflow 顺序 polish → home_probe",
+          lambda: (("python scripts/polish.py" in yml and "python scripts/home_probe.py" in yml
+                    and yml.index("python scripts/polish.py") < yml.index("python scripts/home_probe.py")),
+                   "polish 在探测之前" if yml else "未读到 update.yml"))
+
+    def c_gitadd():
+        # 只看真正的命令行：注释里也会提到旧写法（含 "|| true"），不能拿注释误判
+        code = "\n".join(l for l in yml.splitlines()
+                         if not l.strip().startswith("#"))
+        silent = (re.search(r"git add -f[^\n]*\|\|\s*true", code) is not None
+                  or "2>/dev/null || true" in code)
+        loops = "for f in" in code and '[ -e "$f" ]' in code
+        guarded = "缺少必需产物" in code
+        return (not silent and loops and guarded,
+                "逐文件 git add=%s / 无静默吞失败=%s / 必需产物显式检查=%s" %
+                (loops, not silent, guarded))
+
+    check("B02", B, "本轮：git add -f 整条 + || true 会静默吞掉当天全部提交",
+          "workflow 提交步骤逐文件判断且不吞错误", c_gitadd)
+
+    check("B03", B, "第十轮：bash -e 末轮 `[ ... ] && sleep` 返回 1 导致 purge 跳过",
+          "workflow 无 && sleep 末表达式",
+          lambda: ("&& sleep 8" not in yml,
+                   "已改为 if/exit 0 结构" if yml else "未读到 update.yml"))
+
+    check("B04", B, "第九轮：jsDelivr @main 顽固缓存 / purge 需多轮",
+          "purge 同时清两种路径且 workflow 至少 2 轮",
+          lambda: (('repo + "/" + path' in text("scripts/purge_cdn.py")
+                    and 'repo + "@main/" + path' in text("scripts/purge_cdn.py")
+                    and re.search(r"--attempts\s+[2-9]", yml) is not None),
+                   "无版本号 + @main 双路径 purge；--attempts 3"))
+
+    check("B05", B, "第八轮：stable tag 里没有新增文件却造出 404 链接 / 连续 3 天才推进",
+          "stable.py 用 git cat-file 判文件、min-streak 3",
+          lambda: (("cat-file" in text("scripts/stable.py")
+                    and '"-e"' in text("scripts/stable.py")
+                    and "tag_contains" in text("scripts/stable.py")
+                    and "--min-streak 3" in yml),
+                   "tag_contains 用 git cat-file -e 判文件存在 + 3 天连胜门槛均在位"))
+
+    check("B06", B, "第十一轮：同一天多次运行 history 覆盖快照",
+          "history.py 按日期存快照、连胜按天计",
+          lambda: (('["date"]' in text("scripts/history.py")
+                    and "assert_pass_streak" in text("scripts/history.py")),
+                   "快照按 date 命名，streak 按天数"))
+
+    def c_sources():
+        lines = [l.strip() for l in text("sources.txt").splitlines()
+                 if l.strip() and not l.strip().startswith("#")]
+        bad_lines = [l for l in lines if not re.match(r"^[^|]+\|https?://\S+(\|https?://\S+)?$", l)]
+        return (not bad_lines and len(lines) >= 20,
+                "%d 个上游源，格式异常 %d 条" % (len(lines), len(bad_lines)))
+
+    check("B07", B, "第九轮：choose_base 第三列修相对仓库根的路径",
+          "sources.txt 格式合法且源数量未塌", c_sources)
+
+    check("B08", B, "第十轮：关键词外置 / 生成物本地只读",
+          "blocklist 非空、.gitignore 覆盖、local_readonly 在位",
+          lambda: (len([l for l in text("blocklist.txt").splitlines()
+                        if l.strip() and not l.strip().startswith("#")]) >= 10
+                   and all(x in text(".gitignore") for x in
+                           ("/tvbox*.json", "/site/", "/reports/", "/history/", "/archive/"))
+                   and os.path.exists(path("scripts/local_readonly.py")),
+                   "blocklist / .gitignore / local_readonly.py 三项齐全"))
+
+    def c_assert_cov():
+        src = text("scripts/assertions.py")
+        missing = [k for k in REQUIRED_ASSERTIONS if ('record("%s"' % k) not in src]
+        return not missing, ("缺少断言：%s" % ", ".join(missing) if missing else
+                             "%d 条关键硬断言全部在位" % len(REQUIRED_ASSERTIONS))
+
+    check("B09", B, "各轮修复必须有硬断言守着，不能只靠文档",
+          "assertions.py 覆盖全部关键回归防线", c_assert_cov)
+
+    def c_assert_result():
+        # 断言结果按环境分流：CI 读 reports/assertions.json（入库），本地读
+        # _assertions.json。硬编码下划线文件会让 CI 里 B10 恒失败。
+        # 必须校验日期：入库结论是 tracked 文件，沿用昨天那份也会 passed=True
+        a = common.load_result("assertions", {}, fresh=True) or {}
+        return (a.get("passed") is True,
+                "date=%s / passed=%s，%d 项检查，失败 %s" %
+                (a.get("date"), a.get("passed"), len(a.get("checks") or {}),
+                 [x.get("name") for x in (a.get("failed") or [])][:3]))
+
+    check("B10", B, "每日保险丝结果", "当日回归断言已通过", c_assert_result)
+
+    def c_quality():
+        q = load("quality.json", {}) or {}
+        need = ("trend", "days_recorded", "assert_pass_streak", "sample_rates",
+                "jar_fail_streak", "ext_fail_streak")
+        miss = [k for k in need if k not in q]
+        return not miss, ("缺少字段：%s" % ", ".join(miss) if miss else
+                          "多日历史 / 连败 / 抽样基线字段齐全（%d 天）" % (q.get("days_recorded") or 0))
+
+    check("B11", B, "第十轮：误杀率 52% 证明单日判定不可信",
+          "quality.json 保留多日历史与抽样基线", c_quality)
+
+    def c_b12():
+        # README 后来按用户要求精简成「链接 + 含义 + 免责声明」，不再罗列
+        # jsDelivr 备用链接，原检查里「不要用不带 @main 的链接」那句已随章节
+        # 一起移除 —— 继续硬找这句话会恒失败。改查它真正想守的风险：README
+        # 主推 Pages、不出现无版本号的 jsDelivr 直链、健康页直链都带 @main。
+        readme = text("README.md")
+        hp = text("scripts/health.py")
+        unversioned = [u for u in re.findall(
+            r"https?://(?:cdn|fastly|gcore|testingcf)\.jsdelivr\.net/gh/[^\s`)\]]+",
+            readme) if "@" not in u.split("/gh/", 1)[-1].split("/", 1)[0]]
+        ok = ("dimogu.github.io/tvbox-merged/" in readme
+              and "@main/%s" in hp
+              and not unversioned)
+        return ok, ("README 主推 Pages、无无版本号 CDN 直链；健康页直链均带 @main"
+                    if ok else "README/健康页口径不一致：Pages=%s, @main=%s, 无版本CDN=%s"
+                    % ("dimogu.github.io/tvbox-merged/" in readme,
+                       "@main/%s" in hp, unversioned[:2]))
+
+    check("B12", B, "第九轮：README 要求 Pages 主线路；健康页给无版本 CDN 链接",
+          "README 主线路 Pages / health.py 直链带 @main", c_b12)
+
+    def c_html():
+        h = text(os.path.join("site", "index.html"))
+        if h:
+            op, cl = h.count("<table>"), h.count("</table>")
+            return op == cl, ("生成页 %d 个 <table> / %d 个 </table>%s" %
+                              (op, cl, "（闭合平衡）" if op == cl else "（结构破损）"))
+        # CI 里本步骤跑在 health.py 之前，页面还没生成。改做源码静态检查：
+        # 每个 p.append("</table>") 往上找最近的、缩进更小的块头，若是 for
+        # 就说明闭合写进了循环体（本轮那个 bug 的形态），if 块内则合法。
+        lines = text("scripts/health.py").splitlines()
+        bad, closes = [], 0
+        for i, line in enumerate(lines):
+            if 'p.append("</table>")' not in line:
+                continue
+            closes += 1
+            indent = len(line) - len(line.lstrip())
+            # 往上找最近的、缩进更小的 for 块头；再看这个块到闭合行之间
+            # 有没有缩进 <= for 的代码行（有 = 块已结束）。纯注释行要跳过，
+            # 否则紧挨闭合标签的注释会被误当成父块，把 bug 漏过去。
+            for j in range(i - 1, -1, -1):
+                prev = lines[j]
+                stripped = prev.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                pi = len(prev) - len(prev.lstrip())
+                if pi < indent and re.match(r"\s*for\b", prev):
+                    ended = any(
+                        ln.strip() and not ln.lstrip().startswith("#")
+                        and (len(ln) - len(ln.lstrip())) <= pi
+                        for ln in lines[j + 1:i]
+                    )
+                    if not ended:
+                        bad.append("health.py:%d 的 </table> 落在 L%d 的 for 循环体内"
+                                   % (i + 1, j + 1))
+                    break
+        return (not bad and closes > 0,
+                ("源码静态检查：%d 个表格闭合均在循环外" % closes) if not bad else
+                "; ".join(bad))
+
+    check("B13", B, "本轮：健康页 </table> 写在 for 循环体内（线上 33 闭合 / 5 开标签）",
+          "生成的健康页 HTML 表格标签平衡", c_html, critical=False)
+
+    def c_compile():
+        scripts = sorted(f for f in os.listdir(path("scripts")) if f.endswith(".py"))
+        errs = []
+        for f in scripts:
+            try:
+                py_compile.compile(path(os.path.join("scripts", f)), doraise=True)
+            except Exception as e:
+                errs.append("%s:%s" % (f, str(e)[:60]))
+        return not errs, ("%d 个脚本全部编译通过" % len(scripts) if not errs else
+                          "; ".join(errs[:3]))
+
+    check("B14", B, "每轮交付前的基础检查", "全部 scripts/*.py 可编译", c_compile)
+
+    def c_pointer():
+        s = load("stable.json", {}) or {}
+        tag, commit = s.get("tag", ""), s.get("commit", "")
+        if not tag:
+            return None, "尚无稳定版指针"
+        try:
+            r = subprocess.run(["git", "rev-list", "-n", "1", tag], cwd=ROOT,
+                               capture_output=True, text=True, timeout=15)
+            actual = (r.stdout or "").strip()
+        except Exception:
+            actual = ""
+        return (bool(actual) and (not commit or actual == commit),
+                "tag=%s / 指针 commit=%s / tag 实际=%s" %
+                (tag, (commit or "—")[:10], (actual or "—")[:10]))
+
+    check("B15", B, "本轮：tag 复用时指针 commit 写成当前 HEAD、与不可变 tag 不一致",
+          "stable.json 的 commit 指向 tag 实际提交", c_pointer)
+
+    def c_polish_abort():
+        src = text("scripts/polish.py")
+        i = src.find("collections_aborted =")
+        seg = src[i:i + 300] if i >= 0 else ""
+        return (i >= 0 and "* 0.5" not in seg and "not parses" in seg,
+                ("兜底只判「清空」，不会把 parse_cap 的配额截断当异常回退"
+                 if i >= 0 and "* 0.5" not in seg else
+                 "兜底仍在用半量阈值，会把 285→80 的正常截断误判成异常"))
+
+    check("B16", B, "本轮：lives/parses 半量兜底误伤设计内解析截断（已被断言拦下）",
+          "polish 的集合兜底只在被清空时触发", c_polish_abort)
+
+    # ---------- B17-B21：第十一轮复核修复的源码级防线 ----------
+
+    def c_upstream_guard():
+        b = text("scripts/build.py")
+        return ("isinstance(cfg, dict)" in b and "common.safe_url(url)" in b,
+                "非 dict JSON 跳过该源 + fetch 先 percent-encode，单源坏数据不再拖垮整天构建")
+
+    check("B17", B, "本轮：上游改版返回 JSON 数组让整个每日构建崩溃",
+          "build.py 对非对象 JSON 与非法 URL 有兜底", c_upstream_guard)
+
+    def c_media_check():
+        pp = text("scripts/play_probe.py")
+        i = pp.find("looks_media =")
+        seg = pp[i:i + 400] if i >= 0 else ""
+        return (i >= 0 and "<html" in seg and "<!doctype" in seg and
+                "or len(body) > 0)" not in seg,
+                "魔数白名单 + HTML 黑名单，不再「任何非空 200 都算媒体」")
+
+    check("B18", B, "本轮：`or len(body) > 0` 让可播率判定完全失效（虚高）",
+          "play_probe 媒体判定排除 HTML", c_media_check)
+
+    def c_revive_guard():
+        rc = text("scripts/recheck.py")
+        ok = ("内容非空(非HTML)" in rc and '"<html" not in head' in rc)
+        return ok, ("复活兜底排除 HTML 错误页，死源能攒够连败被淘汰" if ok
+                    else "recheck 的 HTTP200 兜底未排除 HTML，回退到旧行为")
+
+    check("B19", B, "本轮：反爬源 200+HTML 被当成「复活」，死源永不淘汰",
+          "recheck 复活判定剔掉 HTML 页面", c_revive_guard)
+
+    def c_serve_guard():
+        sv = text("scripts/serve.py")
+        return ("if etag and self.headers.get" in sv
+                and "tvbox-merged@main\"" in sv
+                and all(x in sv for x in ("tvbox-quality.json", "tvbox-cn-fast.json",
+                                          "tvbox-stable7.json")),
+                "304 判定有 etag 前置 / 默认上游带 @main / FILES 含三个场景版")
+
+    check("B20", B, "本轮：serve.py 无 etag 时普通 GET 也回 304、默认上游无 @main、缺三个场景版",
+          "自托管入口三处修复在位", c_serve_guard)
+
+    def c_streak_dates():
+        hp = text("scripts/history.py")
+        yml = text(".github/workflows/update.yml")
+        return ("fromisoformat" in hp and "git pull --rebase origin main" in yml,
+                "连胜按日历日连续累计；CI push 前先 rebase，两个工作流不再互拒")
+
+    check("B21", B, "本轮：断言失败的缺快照日被跳过、stable 3 天门槛可被绕过；两工作流 push 互撞",
+          "history 连胜日期连续性 + workflow push 前 rebase", c_streak_dates)
+
+    def c_mirror_watch():
+        pc = text("scripts/purge_cdn.py")
+        h = text("scripts/health.py")
+        return ("MIRROR_HOSTS" in pc and "gcore.jsdelivr.net/gh/%s@main" in h,
+                "purge 记录 fastly/gcore 滞后；健康页自检覆盖 gcore 线路")
+
+    check("B22", B, "本轮：README 推荐的 gcore / 健康页推荐的 fastly 是 12h 缓存盲区",
+          "推荐镜像滞后可被发现", c_mirror_watch)
+
+    def c_results_committed():
+        # 上一版这里只查「源码里出现过 reports/xxx.json 这几个字符串」，把
+        # 提交清单整段删掉照样通过，是恒真的假验收。改成查实际链路：命令、
+        # 提交清单、以及 result_path 在 CI / 本地的真实分流行为。
+        raw = text(".github/workflows/update.yml")
+        yml = "\n".join(l for l in raw.splitlines()
+                        if not l.lstrip().startswith("#"))
+        cmds = ("--output reports/assertions.json",
+                "--json-output reports/regression.json",
+                "--output reports/build-status.json")
+        paths = ("reports/assertions.json", "reports/regression.json",
+                 "reports/build-status.json")
+        a = yml.find("- name: 提交配置与判定历史")
+        b = yml.find("- name: 归档 + 稳定版指针")
+        commit_seg = yml[a:b] if 0 <= a < b else ""
+        probe = ("import sys; sys.path.insert(0, 'scripts'); import common; "
+                 "print(common.result_path('assertions'), "
+                 "common.result_path('regression'), common.result_path('build_status'))")
+
+        def split_paths(ci):
+            env = dict(os.environ)
+            env.pop("GITHUB_ACTIONS", None)
+            if ci:
+                env["GITHUB_ACTIONS"] = "true"
+            r = subprocess.run([sys.executable, "-c", probe], cwd=ROOT,
+                               env=env, capture_output=True, text=True, timeout=30)
+            return r.stdout.strip().split()
+
+        ci_paths, local_paths = split_paths(True), split_paths(False)
+        bad = []
+        if not all(c in yml for c in cmds):
+            bad.append("缺少 CI 显式 --output 命令")
+        if not all(p in commit_seg for p in paths):
+            bad.append("提交清单未入库三份结果")
+        if ci_paths != list(paths):
+            bad.append("CI 分流错误：%s" % ci_paths)
+        if local_paths != ["_assertions.json", "_regression.json",
+                           "_build_status_local.json"]:
+            bad.append("本地分流错误：%s" % local_paths)
+        if "result_fresh" not in text("scripts/common.py"):
+            bad.append("消费端缺日期新鲜度校验")
+        if "fresh=True" not in text("scripts/health.py"):
+            bad.append("健康页仍会读旧结论")
+        if "_regression-local.md" not in text(".gitignore"):
+            bad.append("本地报告未隔离")
+        return not bad, ("三份结论显式入库；CI→reports/、本地→_*.json 实测分流正确；"
+                         "消费端校验日期" if not bad else "；".join(bad))
+
+    check("B23", B, "本轮：_assertions.json / _regression.json 被忽略，外部无法核对当日结论；"
+          "本地试跑还会覆盖出过时快照",
+          "每日结论入库 + 本地试跑隔离", c_results_committed)
+
+    def c_no_stale_products():
+        # 同样不能只查文本：真正跑一次 build_status.collect()，验证失败 /
+        # env 漏传时 degraded 会被置上，并检查清除列表是否覆盖全部产物。
+        raw = text(".github/workflows/update.yml")
+        yml = "\n".join(l for l in raw.splitlines()
+                        if not l.lstrip().startswith("#"))
+        start, end = yml.find("rm -f"), yml.find('echo "已清除')
+        rmseg = yml[start:end] if 0 <= start < end else ""
+        must_clean = (
+            "tvbox-home.json", "tvbox-full-homefirst.json",
+            "tvbox-lite-homefirst.json", "tvbox-network-homefirst.json",
+            "tvbox-quality.json", "tvbox-cn-fast.json", "tvbox-stable7.json",
+            "home-sites.txt", "reports/assertions.json",
+            "reports/regression.json", "reports/build-status.json",
+            "reports/audit-latest.md", "reports/regression-latest.md")
+        ids = ("audit", "home_probe", "recheck", "play_probe", "rank_home",
+               "variants", "search_rank", "jar_health", "regression")
+        import build_status
+        saved = {v: os.environ.get(v) for v in build_status.STEP_VARS.values()}
+        try:
+            for v in build_status.STEP_VARS.values():
+                os.environ[v] = "success"
+            clean_run = build_status.collect()
+            os.environ["STEP_HOME_PROBE"] = "failure"
+            fail_run = build_status.collect()
+            os.environ["STEP_AUDIT"] = ""      # env 漏传 -> unknown
+            missing_run = build_status.collect()
+        finally:
+            for v, old in saved.items():
+                if old is None:
+                    os.environ.pop(v, None)
+                else:
+                    os.environ[v] = old
+
+        hp, sp, h = (text("scripts/history.py"), text("scripts/stable.py"),
+                     text("scripts/health.py"))
+        bad = []
+        if not all(x in rmseg for x in must_clean):
+            bad.append("清除列表缺：%s" % [x for x in must_clean if x not in rmseg])
+        if not all(("id: %s" % s) in yml for s in ids):
+            bad.append("continue-on-error 步骤 id 不全")
+        if not all(v in yml for v in build_status.STEP_VARS.values()):
+            bad.append("STEP_* env 与 build_status.py 不一致")
+        if not (clean_run["degraded"] is False
+                and fail_run["degraded"] is True
+                and "home_probe" in fail_run["config_steps_failed"]
+                and missing_run["degraded"] is True
+                and "audit" in missing_run["incomplete_steps"]):
+            bad.append("collect() 未把 failure/unknown 判为降级")
+        if not (common.build_status_fresh({"date": common.today(), "run_id": ""})
+                and not common.build_status_fresh({"date": "2000-01-01"})):
+            bad.append("构建状态日期校验失效")
+        if not ("load_build_status" in hp and "降级版不推进" in sp
+                and "本轮是降级版" in h and "if streak < args.min_streak:" in sp):
+            bad.append("降级日门槛被回退")
+        return not bad, ("清除 7 份配置 + 5 份结论；9 步 env 对齐；实测 "
+                         "failure/unknown→降级、过期状态被拒、bootstrap 需连胜"
+                         if not bad else "；".join(bad))
+
+    check("B24", B, "本轮：探测失败不阻断 → 上一版派生配置被当作今日成果发布成混搭；"
+          "workflow 全绿但健康页缺数据",
+          "探测失败不沿用旧产物 + 降级可见", c_no_stale_products)
+
+    def c_bad_tag_marked():
+        sp = text("scripts/stable.py")
+        h = text("scripts/health.py")
+        bad = []
+        if "KNOWN_BAD_TAGS" not in sp or "def deprecations" not in sp:
+            bad.append("stable.py 不再记录历史坏 tag")
+        elif '"deprecated": deprecations(state)' not in sp:
+            bad.append("write_pointer 不再把登记表写进 stable.json")
+        if "deprecated_reason" not in h or "请勿导入" not in h:
+            bad.append("健康页不再把坏 tag 降级为「请勿导入」")
+        # 指针已存在就不是 bootstrap：hold 与降级两条保留旧指针的分支都必须清标记
+        if sp.count('state["bootstrap"] = False') < 2:
+            bad.append("hold / 降级分支未清除 bootstrap 标记")
+        # 行为校验（不依赖执行顺序）：直接调两个纯函数，验证登记表会合并、
+        # 且健康页能把「当前 tag 有缺陷」翻译成可展示的原因。
+        try:
+            import stable as S
+            import health as H
+            merged = S.deprecations({"deprecated": {"stable-old": "历史遗留"}})
+            if "stable-old" not in merged or not all(k in merged for k in S.KNOWN_BAD_TAGS):
+                bad.append("deprecations() 没有合并代码登记与文件登记")
+            hit = H.stable_block({"tag": "stable-old",
+                                  "deprecated": {"stable-old": "导入会报错"}})
+            miss = H.stable_block({"tag": "stable-new",
+                                   "deprecated": {"stable-old": "导入会报错"}})
+            if hit["deprecated_reason"] != "导入会报错" or miss["deprecated_reason"]:
+                bad.append("stable_block() 未按当前 tag 正确带出/清空废弃原因")
+        except Exception as e:
+            bad.append("纯函数校验失败：%s" % e)
+        return not bad, ("坏 tag 登记合并、健康页按当前 tag 输出「请勿导入」原因，"
+                         "指针存在时 bootstrap 必被清除"
+                         if not bad else "；".join(bad))
+
+    check("B25", B, "本轮：稳定版 tag 内容有缺陷却仍被当推荐线路，用户照着导入必报错；"
+          "指针已存在还自称 bootstrap",
+          "已知坏 tag 显式标注 + 健康页拦截", c_bad_tag_marked)
+
+    def c_parse_ext_not_filtered():
+        try:
+            import build as Bm
+        except Exception as e:
+            return False, "无法导入 build：%s" % e
+        bad = []
+        # 探针用「成人」这类长期存在的关键词，避免依赖用户随时会改的那几条。
+        # 解析的 ext 是能力声明（{"flag": [...] }），不是资源链接；按整段 ext
+        # 过滤会把「顺带支持某平台」的通用解析全删光 —— 实际就这么删掉过 103 条。
+        probe = {"name": "通用解析", "type": 1, "url": "https://jx.example.com/?url=",
+                 "ext": {"flag": ["成人"], "header": {"user-agent": "okhttp/3"}}}
+        if not Bm.blocked(probe):
+            bad.append("blocked() 口径失效：ext 命中却未拦")
+        if Bm.blocked_parse(probe):
+            bad.append("blocked_parse() 把 ext 里的能力清单当资源命中")
+        # 身份字段（名称 / url）仍然要拦
+        if not Bm.blocked_parse({"name": "成人专区", "url": "https://x/y"}):
+            bad.append("blocked_parse() 放过名称命中的解析")
+        if not Bm.blocked({"name": "某站", "api": "csp_X", "ext": "https://x/成人/a"}):
+            bad.append("站点 ext 命中未被拦")
+        # 成品端到端：站点按全字段、解析按身份字段，都要零残留
+        cfg = common.load_json("tvbox.json", {}) or {}
+        left_s = [o.get("name") for o in cfg.get("sites") or [] if Bm.blocked(o)][:3]
+        left_p = [o.get("name") for o in cfg.get("parses") or [] if Bm.blocked_parse(o)][:3]
+        if left_s or left_p:
+            bad.append("成品仍有残留：站点 %s / 解析 %s" % (left_s, left_p))
+        return not bad, ("解析只按名称/url 过滤、ext 能力清单不参与；站点仍按全字段；"
+                         "成品零残留" if not bad else "；".join(bad))
+
+    check("B26", B, "本轮：按整段 ext 过滤，把「顺带支持哔哩」的通用解析当哔哩资源批量删掉",
+          "解析过滤只看身份字段，ext 能力清单不参与", c_parse_ext_not_filtered)
+
+    def c_pan_scope():
+        try:
+            import build as Bm
+        except Exception as e:
+            return False, "无法导入 build：%s" % e
+        bad = []
+        # 用户要求「盘」只匹配网盘类写法。裸「盘」会误删两类正常条目：
+        # 盘古解析（视频解析服务 pangujiexi.cc）和 CSP 站点 ext 模板里的
+        # 「[不包含:网盘下载]」（页面筛选说明）。
+        for name in ("网盘 | Alist", "123 • 云盘", "盘搜|集合", "☁️原盘┃4K",
+                     "盘她┃三盘", "🆘123┃[个人盘]", "❤盤搜", "💡聚剧┃四盘"):
+            if not Bm.blocked({"name": name, "api": "csp_X"}):
+                bad.append("网盘类写法未拦截：%s" % name)
+        for name in ("盘古 · pangujiexi.cc", "盘古"):
+            if Bm.blocked({"name": name, "api": "https://pangujiexi.cc/?url=1"}):
+                bad.append("盘古解析被当成网盘资源删除：%s" % name)
+        # ext 模板里的筛选说明（「不包含:网盘下载」）说的是「页面上不要什么」，
+        # 不是站内收录内容；扫关键词前必须剥掉，否则正常影视站被整条删掉。
+        tpl = {"name": "修罗|弹幕", "api": "csp_HBPQCAT",
+               "ext": '{"播放标题":"text-muted\\">&&</td>[不包含:网盘下载]"}'}
+        if Bm.blocked(tpl):
+            bad.append("ext 模板里的「不包含:网盘下载」被当成网盘资源")
+        # 剥离只针对筛选说明语法：真写了网盘链接，照样要拦
+        if not Bm.blocked({"name": "某影视站", "api": "csp_X",
+                           "ext": "https://pan.example.com/s/1 网盘"}):
+            bad.append("真网盘链接被放过")
+        rules = [ln.strip() for ln in text("blocklist.txt").splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")]
+        if "盘" in rules:
+            bad.append("blocklist 退回成裸「盘」规则")
+        if "FILTER_NOTE_RX" not in text("scripts/build.py"):
+            bad.append("筛选说明剥离逻辑被删（模板文字会再次误删正常站）")
+        return not bad, ("「盘」只认网盘类写法（含繁体）、盘古解析不受影响、"
+                         "模板里的筛选说明不触发、真网盘链接照拦"
+                         if not bad else "；".join(bad))
+
+    check("B27", B, "本轮：用裸「盘」过滤，把盘古解析与 ext 模板文字里的"
+          "「不包含:网盘下载」一起当网盘资源删掉",
+          "「盘」只匹配网盘类写法 + 剥离筛选说明", c_pan_scope)
+
+    def c_search_order():
+        """本站点顺序 = 客户端搜索结果顺序，顺序错了前面全是不能用的线路。"""
+        sr = text("scripts/search_rank.py")
+        raw = text(".github/workflows/update.yml")
+        yml = "\n".join(l for l in raw.splitlines()
+                        if not l.lstrip().startswith("#"))
+        bad = []
+        if "def order(" not in sr or "def family(" not in sr:
+            bad.append("search_rank 的排序实现被拆掉")
+        if "pins.txt" not in sr:
+            bad.append("置顶名单不再读取（用户指定的线路会退回原位）")
+        if "python scripts/search_rank.py" not in yml:
+            bad.append("workflow 不再执行 search_rank")
+        else:
+            # 顺序要点：跑在所有配置生成之后，否则被 home_probe / rank_home /
+            # variants 的重排覆盖，等于这一步白做。
+            at = yml.index("python scripts/search_rank.py")
+            for later in ("polish.py", "home_probe.py", "rank_home.py",
+                          "variants.py"):
+                if yml.index("python scripts/" + later) > at:
+                    bad.append("search_rank 跑在 %s 之前，排序会被覆盖" % later)
+        if "search_order_sane" not in text("scripts/assertions.py"):
+            bad.append("硬断言不再守搜索顺序")
+
+        # 行为校验（不依赖本轮产物、也不依赖当前文件里的顺序）：造三条假站点
+        # 直接过一遍 order()，验证「置顶真的到最前」「非影视类目真的被压后」。
+        # 只看配置文件里有没有那几行代码，写错了也照样通过。
+        import search_rank as SR
+        probe = [{"name": "磁力 • 合集", "api": "csp_A", "type": 3},
+                 {"name": "普通影视站", "api": "csp_B", "type": 3},
+                 {"name": "占位置顶站", "api": "csp_C", "type": 3}]
+        got = [str(s.get("name")) for s in
+               SR.order(probe, ["占位置顶站"], {}, lambda s: 1, {}, use_home=False)]
+        if got[0] != "占位置顶站":
+            bad.append("置顶名单没把指定站点移到第一位（实际 %s）" % got[0])
+        if got.index("磁力 • 合集") < got.index("普通影视站"):
+            bad.append("非影视类目没有被压后（磁力站排在影视站之前）")
+        if '"search-first"' not in sr:
+            bad.append("配置里不再标记 order=search-first（断言无法核对）")
+        # 真实配置过一遍：排序只许换顺序，不许少站
+        sites = (common.load_json("tvbox.json", {}) or {}).get("sites") or []
+        if not sites:
+            bad.append("tvbox.json 读不到，无法验证排序行为")
+        else:
+            try:
+                n = len(SR.order(sites, SR.load_pins(), {}, lambda s: 1, {},
+                                 use_home=False))
+                if n != len(sites):
+                    bad.append("排序后站点数 %d != %d（会丢站）" % (n, len(sites)))
+            except Exception as e:
+                bad.append("真实配置排序报错：%s" % str(e)[:60])
+        return not bad, ("顺序 = 置顶 > 实测可播 > 影视类目 > 探活分层，"
+                         "同源连号按每屏打散；跑在所有配置生成之后"
+                         if not bad else "；".join(bad))
+
+    check("B28", B, "本轮：搜索栏按名称字母排 —— 数字/emoji 起头的站霸占第一屏，"
+          "实测能播的线路被挤到六七百位之后",
+          "站点顺序按搜索可播优先 + 置顶名单", c_search_order)
+
+
+    # ---------- B. 构建链路（直播源） ----------
+    def c_live_shell():
+        """收费壳判定：既不能漏判，也不能把正常大列表当成广告源删掉。"""
+        import live_audit as LA
+        bad = []
+        # 实测形态：1619 个频道，1588 条指向同一个 vip_notice.mp4
+        shell = {"name": "广告农场", "url": "http://124.71.19.220/live/1/1?v=1",
+                 "chans": 1619, "ad": 1588, "ad_ratio": 0.98, "reuse": 1588,
+                 "reuse_url": "http://124.71.19.220/static/media/vip_notice.mp4"}
+        normal = {"name": "正常大列表", "url": "http://ok.example/tv.txt",
+                  "chans": 2689, "ad": 18, "ad_ratio": 0.007, "reuse": 3,
+                  "reuse_url": "http://ok.example/a.m3u8"}
+        if LA.shell_score(shell) < 2:
+            bad.append("98%% 广告 + 提示视频复用的源没被判成收费壳")
+        if LA.shell_score(normal) >= 2:
+            bad.append("0.7%% 广告的正常列表被误判成收费壳")
+        # 同族扩散：同 host 同前两段路径的失败列表要一起清
+        rows = [dict(shell, shell=2),
+                {"name": "同族另一个列表", "url": "http://124.71.19.220/live/1/2?v=1",
+                 "chans": 0, "ad": 0, "ad_ratio": 0.0, "reuse": 0, "reuse_url": "",
+                 "shell": 0},
+                {"name": "同 host 正常列表", "url": "http://124.71.19.220/other/tv.txt",
+                 "chans": 500, "ad": 2, "ad_ratio": 0.004, "reuse": 2,
+                 "reuse_url": "http://124.71.19.220/other/a.m3u8", "shell": 0}]
+        got = LA.shell_urls(rows)
+        if "http://124.71.19.220/live/1/1?v=1" not in got:
+            bad.append("收费壳自身没进剔除名单")
+        if "http://124.71.19.220/live/1/2?v=1" not in got:
+            bad.append("同族拉不到的列表没被一起清掉（会留尾巴）")
+        if "http://124.71.19.220/other/tv.txt" in got:
+            bad.append("同 host 但不同路径族的正常列表被误删")
+        # 本机反代 / GitHub 反代不扩散：它们下面挂着几十个不同作者的列表
+        rows2 = [dict(shell, url="http://127.0.0.1:9978/proxy?do=live&url=x", shell=2),
+                 {"name": "另一条内置", "url": "http://127.0.0.1:9978/proxy?do=migu",
+                  "chans": 0, "ad": 0, "ad_ratio": 0.0, "reuse": 0,
+                  "reuse_url": "", "shell": 0}]
+        if len(LA.shell_urls(rows2)) != 1:
+            bad.append("按 host 扩散到了本机反代（会一次删掉几十条内置直播源）")
+        return not bad, ("广告占比 >=50%% 或提示视频覆盖 >=30%% 频道即判壳，"
+                         "同族扩散但排除反代 host" if not bad else "；".join(bad))
+
+    check("B29", B, "本轮：直播源里出现「整站频道都指向一个 VIP 提示视频」的收费壳，"
+          "用户点开任何台都是广告",
+          "收费 / 导流直播源判定与按族剔除", c_live_shell)
+
+    def c_henan():
+        """河南台专列表：识台、纠错名、只收实测可播，三件事都不能错。"""
+        import live_audit as LA
+        bad = []
+        cases = [
+            ("http://h.example/hls/33/index.m3u8", "河南卫视"),
+            ("http://h.example/hls/49/index.m3u8", "河南卫视高清"),
+            ("https://dxtx.hntv.tv/live/lypd.m3u8", "河南梨园频道"),
+            ("http://x.example/tv/hn.php?id=hnws", "河南卫视"),
+        ]
+        for u, want in cases:
+            got = LA.fix_name("河南卫视", u)
+            if got != want:
+                bad.append("%s 应为 %s，实为 %s" % (u[-24:], want, got))
+        # 组播 / IPv6 不算可播：前者只在当地运营商内网有效，后者本机无出口
+        for u, kind in (("http://x/rtp/239.1.1.1:5140", "multicast"),
+                        ("http://[2409:8087::1]:80/a.m3u8", "v6")):
+            ok, k, _ = LA.probe(u, timeout=1)
+            if ok or k != kind:
+                bad.append("%s 应判 %s，实际 %s/%s" % (u[:26], kind, ok, k))
+        # 专列表只收实测可播，且必须是标准 M3U
+        rows = [{"ch": "河南卫视", "url": "http://a/1.m3u8", "ok": True, "rk": (0, 0, -3)},
+                {"ch": "河南卫视", "url": "http://a/2.m3u8", "ok": False, "rk": (9, 5, 0)},
+                {"ch": "河南卫视高清", "url": "http://a/3.m3u8", "ok": True, "rk": (0, 0, -1)}]
+        txt, n = LA.build_henan_m3u(rows, per_ch=6, total=40)
+        if not txt.startswith("#EXTM3U") or n != 2:
+            bad.append("专列表应只收 2 条可播线路（实际 %d 条）" % n)
+        if "http://a/2.m3u8" in txt:
+            bad.append("不可播线路混进了专列表")
+        # 真实产物过一遍（审计步骤失败时文件不存在，跳过而不是判失败）
+        if os.path.exists("live-henan.m3u"):
+            t = open("live-henan.m3u", encoding="utf-8").read()
+            if not t.startswith("#EXTM3U") or "#EXTINF" not in t:
+                bad.append("live-henan.m3u 结构不合规")
+        return not bad, ("频道号纠名 + 组播/v6 排除 + 只收实测可播"
+                         if not bad else "；".join(bad))
+
+    check("B30", B, "本轮：网上搜到 389 条河南台地址，只有 22 条真出画面，"
+          "且上游把梨园频道错标成「河南卫视」",
+          "河南台识台 / 纠名 / 专列表只收可播", c_henan)
+
+
+    # ---------- C. 线上线路（可选，需网络） ----------
+    if online:
+        opener = urllib.request.build_opener()
+        if proxy:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler(
+                {"http": proxy, "https": proxy}))
+        opener.addheaders = [("User-Agent", "tvbox-regression/1.0")]
+
+        def net(f, url):
+            def run():
+                try:
+                    with opener.open(url, timeout=25) as r:
+                        body = r.read()
+                    local = open(path(f), "rb").read()
+                    same = hashlib.sha256(body).digest() == hashlib.sha256(local).digest()
+                    n = len(json.loads(body).get("sites", []))
+                    return same, "%s：%s / %d 站点" % ("一致" if same else "滞后",
+                                                     hashlib.sha256(body).hexdigest()[:8], n)
+                except Exception as e:
+                    return False, "取回失败：%s" % str(e)[:80]
+            return run
+
+        for i, (label, base) in enumerate((
+                ("GitHub Pages 主线路", "https://dimogu.github.io/tvbox-merged/"),
+                ("jsDelivr @main", "https://cdn.jsdelivr.net/gh/dimogu/tvbox-merged@main/"),
+                ("jsDelivr 无版本号", "https://cdn.jsdelivr.net/gh/dimogu/tvbox-merged/"),
+                # README 推荐 gcore、健康页推荐 fastly，此前两者都不在校验范围，
+                # 12h 边缘缓存滞后的旧版（含对象型 style）会直接导入失败
+                ("fastly @main（健康页推荐镜像）", "https://fastly.jsdelivr.net/gh/dimogu/tvbox-merged@main/"),
+                ("gcore @main（README 推荐镜像）", "https://gcore.jsdelivr.net/gh/dimogu/tvbox-merged@main/")), 1):
+            check("C%02d" % i, C, "第九轮：CDN 同时挂 4 个年代的旧版，导入直接报错",
+                  "%s 与仓库内容一致（全量首页版）" % label,
+                  net("tvbox-full-homefirst.json", base + "tvbox-full-homefirst.json"),
+                  critical=(i == 1))
+
+        def c_health_page():
+            def run():
+                try:
+                    with opener.open("https://dimogu.github.io/tvbox-merged/", timeout=25) as r:
+                        h = r.read().decode("utf-8", "replace")
+                    return h.count("<table>") == h.count("</table>"), \
+                        "HTTP 200 / %d 个表格且闭合平衡 / %d 字节" % (h.count("<table>"), len(h))
+                except Exception as e:
+                    return False, str(e)[:80]
+            return run
+
+        # 循环已生成 C01-C05，这里必须接 C06，否则 --online 会出现两个 C04
+        check("C06", C, "本轮：健康页表格结构破损", "线上健康页可访问且标签平衡",
+              c_health_page(), critical=False)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--online", action="store_true", help="追加线上 Pages/CDN 一致性检查")
+    ap.add_argument("--proxy", default="", help="本机网络需代理时填 http://127.0.0.1:7890")
+    ap.add_argument("--output", default=None,
+                    help="Markdown 报告路径；默认 CI 入库 / 本地隔离")
+    ap.add_argument("--json-output", default=None,
+                    help="结构化结果路径；默认 CI 入库 / 本地隔离")
+    args = ap.parse_args()
+    if args.output is None:
+        args.output = ("reports/regression-latest.md" if common.IS_CI
+                       else "_regression-local.md")
+    if args.json_output is None:
+        args.json_output = common.result_path("regression")
+
+    cfgs, bad = all_configs()
+    build_checks(cfgs, bad, args.online, args.proxy)
+
+    ok = sum(1 for r in RESULTS if r["ok"] is True)
+    fail = [r for r in RESULTS if r["ok"] is False]
+    skip = [r for r in RESULTS if r["ok"] is None]
+    hard_fail = [r for r in fail if r["critical"]]
+    passed = not hard_fail
+
+    out = {
+        "date": common.today(), "env": common.env_info(),
+        "passed": passed, "total": len(RESULTS), "ok": ok,
+        "failed": len(fail), "skipped": len(skip),
+        "hard_failed": [r["id"] for r in hard_fail],
+        "checks": RESULTS,
+    }
+    common.write_json(args.json_output, out, skip_unchanged=False)
+
+    lines = ["# 全历史问题回归复核 · %s" % common.today(), "",
+             "把九轮迭代里真实出现过的故障逐条复核，确认修复仍在、防线没被绕过。",
+             "默认离线，`--online` 追加线上线路比对；判定环境：%s。" %
+             common.env_info()["env"], "",
+             "**结果：%d 项检查，%d 项通过，%d 项未通过（其中阻断 %d 项），%d 项跳过 —— %s**" %
+             (len(RESULTS), ok, len(fail), len(hard_fail), len(skip),
+              "全部通过" if passed else "存在需处理项"), ""]
+    for group in ("产物契约", "构建链路", "线上线路"):
+        rows = [r for r in RESULTS if r["group"] == group]
+        if not rows:
+            continue
+        lines += ["## %s" % group, "",
+                  "| # | 历史出处 | 复核项 | 结果 | 证据 |", "|---|---|---|---|---|"]
+        for r in rows:
+            mark = "✅ 通过" if r["ok"] is True else ("❌ 未通过" if r["ok"] is False else "⏭ 跳过")
+            lines.append("| %s | %s | %s | %s | %s |" %
+                         (r["id"], r["origin"].replace("|", "\\|"),
+                          r["title"].replace("|", "\\|"), mark,
+                          r["detail"].replace("|", "\\|").replace("\n", " ")))
+        lines.append("")
+    if fail:
+        lines += ["## 未通过明细", ""]
+        for r in fail:
+            lines += ["- **%s %s**（%s）：%s" % (r["id"], r["title"],
+                                              "阻断" if r["critical"] else "提示", r["detail"])]
+        lines.append("")
+    lines += ["---", "",
+              "本报告由 `scripts/regression.py` 生成，与 `assertions.py` 的每日保险丝互补："
+              "断言只决定「今天能不能提交」，本报告回答「历史修过的东西有没有悄悄坏掉」。", ""]
+
+    dest = path(args.output)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print("=== 全历史问题回归复核 ===")
+    for r in RESULTS:
+        print("  [%s] %-4s %s" % ("OK" if r["ok"] is True else
+                                  ("FAIL" if r["ok"] is False else "SKIP"),
+                                  r["id"], r["title"]))
+    print("\n%d 项检查 / %d 通过 / %d 未通过（阻断 %d） -> %s" %
+          (len(RESULTS), ok, len(fail), len(hard_fail),
+           "全部通过" if passed else "存在需处理项"))
+    print("报告：%s" % args.output)
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

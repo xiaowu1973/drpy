@@ -1,0 +1,61 @@
+name: discover-upstreams
+
+# 候选上游发现：29 个源会自然衰减，靠人工想起来才补不现实。每月 1/4/7/10…
+# 日 UTC 21:00（北京时间次日 05:00）跑一次，比每周更及时地纳入新源。
+# 注意：日字段的 */3 每月 1 号重置，跨月可能只隔 1 天（1/31 → 2/1），不是
+# 严格的「连续每 3 天」；cron 无法表达连续间隔，需要时改成每天跑 + 状态判间隔。
+# 产出「去重后边际贡献」报告并自动提交，人工看一眼后一键并入 sources.txt。
+on:
+  schedule:
+    - cron: '0 21 */3 * *'   # 每月 1/4/7…31 日 UTC 21:00（北京时间次日 05:00）
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: discover-upstreams
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          # 本作业末尾要 git pull --rebase，默认 depth=1 浅克隆在远端有新提交
+          # 时容易 rebase 失败；update.yml 已显式用 0，这里保持一致。
+          fetch-depth: 0
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 挖候选 + 计算边际贡献
+        run: python scripts/discover.py --max 80 --workers 16
+
+      - name: 提交候选报告
+        run: |
+          # 逐文件判断 + 缺失显式报错：整条 git add 遇到不存在的 pathspec 会
+          # 失败，`|| true` 会把静默失败吞掉（update.yml 第十轮已修，这里同步）
+          missing=0
+          for f in reports/candidates.json; do
+            if [ -e "$f" ]; then git add -f "$f"; else echo "缺少必需产物: $f"; missing=1; fi
+          done
+          for f in reports/candidates-*.md; do
+            [ -e "$f" ] && git add -f "$f"
+          done
+          [ "$missing" = "0" ] || exit 1
+          if git diff --cached --quiet; then
+            echo "报告无变化，跳过提交"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: 上游候选报告 $(date -u +%Y-%m-%d)"
+          # update 工作流可能在本作业期间插进提交，直接 push 会被拒
+          git pull --rebase origin main || { echo "rebase 失败"; git rebase --abort; exit 1; }
+          git push

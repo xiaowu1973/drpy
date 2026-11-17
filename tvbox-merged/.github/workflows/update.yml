@@ -1,0 +1,354 @@
+name: update-tvbox-config
+
+on:
+  schedule:
+    # 每天 UTC 20:00（北京时间次日 04:00）自动构建
+    - cron: '0 20 * * *'
+  workflow_dispatch: {}   # 支持手动触发
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: update-tvbox-config
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── 1. 生成配置 ─────────────────────────────────────────────
+      # 7 份派生配置 + home-sites.txt 是入库的，checkout 下来就是上一版内容。
+      # 若 home_probe / rank_home / variants 失败（都设了 continue-on-error），
+      # 旧文件不会被覆盖，却会被 git add -f 当作今日成果提交 —— 变成「今天的
+      # 新基础配置 + 昨天的场景版」混搭；必需产物检查只看存在性，查不出来。
+      # 构建前先删掉：成功时各脚本会重新生成；失败时文件缺失，回归断言的
+      # json_valid_no_dup_key 与「必需产物」检查会硬阻断，线上保持上一版
+      # 完整配置，绝不发布混搭。
+      #
+      # reports/ 下 5 份「每日结论」同样入库、同样由 continue-on-error 步骤
+      # （audit / regression）生成。第十轮只清了配置，报告没清：步骤失败时
+      # 昨日结论原样提交、被 health.py 复制进 Pages，健康页还把它当本轮结论
+      # 渲染。一并清除，失败时索引里也移除（见提交步骤），杜绝旧报告冒充。
+      - name: 清除上一版派生配置（防止探测失败时旧文件冒充今日产物）
+        run: |
+          rm -f tvbox-home.json \
+                tvbox-full-homefirst.json tvbox-lite-homefirst.json \
+                tvbox-network-homefirst.json \
+                tvbox-quality.json tvbox-cn-fast.json tvbox-stable7.json \
+                home-sites.txt live-henan.m3u \
+                reports/assertions.json reports/regression.json \
+                reports/build-status.json reports/live-audit.json \
+                reports/audit-latest.md \
+                reports/regression-latest.md
+          echo "已清除 7 份派生配置 + home-sites.txt + 河南专列表 + 6 份每日结论，等待本轮重新生成"
+
+      - name: 聚合 + 存活复检（含多日判定、外置过滤、parses 去重）
+        run: python scripts/build.py
+
+      # build.py 只负责「把上游合起来」。这一步按每份版本自己的目标做卫生清理
+      # （空/非法 api、占位符、整型 ext）、接口级去重、同名消歧与可用性排序，
+      # 文件名与线上链接都不变。必须跑在首页探测之前：探测结果按站点下标回填，
+      # 顺序变了就全错位。
+      - name: 三份基础配置后处理（卫生 / 去重 / 消歧 / 可用性排序）
+        run: python scripts/polish.py
+
+      - name: 三份配置复查报告（不阻断，产物 reports/audit-latest.md）
+        id: audit
+        continue-on-error: true
+        run: python scripts/audit.py
+
+      # 首页推荐 ≠ 搜索：分别探测 CMS 首页影片列表、爬虫 jar 与 ext 首页配置。
+      # 云端直连，避免本机网络误判；结果里会写明判定环境。
+      - name: 首页推荐能力探测
+        id: home_probe
+        continue-on-error: true
+        run: |
+          python scripts/home_probe.py \
+            --input tvbox.json --workers 50 \
+            --report home_report.json --output tvbox-home.json
+
+      - name: 误杀率复核（真实 TVBox UA 抽 50 个 fail 重测）
+        id: recheck
+        continue-on-error: true
+        run: python scripts/recheck.py --sample 50 --workers 20
+
+      - name: 端到端可播率探测（列表→详情→播放地址 + 搜索 + parses）
+        id: play_probe
+        continue-on-error: true
+        run: python scripts/play_probe.py --sample 150 --parse-sample 20 --workers 24
+
+      - name: 生成首页优先版（等级 > 近7天可用天数 > 可播得分）
+        id: rank_home
+        continue-on-error: true
+        run: python scripts/rank_home.py
+
+      # 场景版：把探测数据变成「按用途直接选」的成品。探测报告缺失时自动降级保底。
+      - name: 生成三个场景版（精播 / 国内极速 / 7 天稳定）
+        id: variants
+        continue-on-error: true
+        run: python scripts/variants.py
+
+      # 站点数组顺序 = 客户端搜索结果的展示顺序，客户端不能手动排序。这一步
+      # 把「端到端实测能播 / 搜索有结果 / 影视类目」的线路排到前面，并把同一
+      # spider 的连号站按每屏（36 条）打散。必须放在所有配置生成之后：再往前
+      # 跑会被 home_probe / rank_home / variants 的重排覆盖。
+      - name: 搜索优先排序（可播优先 / 类目降权 / 每屏去同源）
+        id: search_rank
+        continue-on-error: true
+        run: python scripts/search_rank.py
+
+      # 直播源审计：lives 里存的是「列表地址」，聚合阶段看不到里面有没有河南台、
+      # 能不能播。这一步把每个列表拆成频道，按「列表→分片」两层实测，剔除
+      # 「一半以上频道是促销/导流」的收费壳，并把实测能出码流的河南台线路
+      # 汇成 live-henan.m3u 插到 lives 第一位。
+      # 必须跑在所有配置生成之后：它要改 lives 顺序，前面任何一步重排都会覆盖。
+      - name: 直播源审计（河南台实测 / 收费源剔除 / 专列表）
+        id: live_audit
+        continue-on-error: true
+        run: python scripts/live_audit.py --apply --workers 12
+
+      # ── 2. 保险丝：任一硬检查失败就中止，线上保持上一版 ──────────
+      - name: 回归断言（失败则不提交）
+        id: assertions
+        run: python scripts/assertions.py --jar-sample 20 --ext-sample 20 --output reports/assertions.json
+
+      # jar / ext 可达性探测：补上「每日只查 api 接口」的盲区。非阻断，
+      # 只产出 _jar_health.json，由 history.py 并入多日连败计数、polish 据此沉底死 jar 站点。
+      - name: jar / ext 可达性探测（非阻断）
+        id: jar_health
+        continue-on-error: true
+        run: python scripts/jar_health.py
+
+      # 全历史问题复核：断言只决定「今天能不能提交」，这里回答「九轮里修过的
+      # 东西有没有悄悄坏掉」。产出 reports/regression-latest.md 与
+      # reports/regression.json（均入库，进 Pages）。非阻断，失败会在健康页标红。
+      - name: 全历史问题回归复核
+        id: regression
+        continue-on-error: true
+        run: python scripts/regression.py --output reports/regression-latest.md --json-output reports/regression.json
+
+      # 8 个步骤都设了 continue-on-error，workflow「全绿」并不代表今日数据
+      # 完整。把每步 outcome 落成入库文件：健康页顶部醒目提示降级，history
+      # 不把降级日算进连续健康，stable 不推进稳定版 tag。
+      - name: 汇总本轮构建状态（探测失败可见、不伪造今日成功）
+        run: python scripts/build_status.py --output reports/build-status.json
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          STEP_AUDIT: ${{ steps.audit.outcome }}
+          STEP_HOME_PROBE: ${{ steps.home_probe.outcome }}
+          STEP_RECHECK: ${{ steps.recheck.outcome }}
+          STEP_PLAY_PROBE: ${{ steps.play_probe.outcome }}
+          STEP_RANK_HOME: ${{ steps.rank_home.outcome }}
+          STEP_VARIANTS: ${{ steps.variants.outcome }}
+          STEP_SEARCH_RANK: ${{ steps.search_rank.outcome }}
+          STEP_LIVE_AUDIT: ${{ steps.live_audit.outcome }}
+          STEP_JAR_HEALTH: ${{ steps.jar_health.outcome }}
+          STEP_REGRESSION: ${{ steps.regression.outcome }}
+
+      # ── 3. 时间维度 ─────────────────────────────────────────────
+      - name: 写入判定历史与质量指标
+        run: python scripts/history.py --days 14
+
+      # 先提交一次：让 stable 的不可变 tag 指向「含当天全部配置文件」的提交。
+      # 生成产物已被 .gitignore 忽略，这里统一用 -f 由 Actions 独家提交。
+      - name: 提交配置与判定历史
+        id: commit
+        run: |
+          # 必需产物缺失必须显式失败：否则线上会停在旧版，日志却显示构建成功。
+          # 10 份配置都是 README / 健康页给出的可用链接，缺任意一份 Pages 上
+          # 就是 404。以前只查 5 份，三个场景版整份缺失时提交、断言、健康页
+          # 都会静默跳过（OPTIONAL_CONFIGS 缺文件不记 bad）。
+          for f in tvbox.json tvbox-lite.json tvbox-network.json \
+                   tvbox-home.json tvbox-full-homefirst.json \
+                   tvbox-lite-homefirst.json tvbox-network-homefirst.json \
+                   tvbox-quality.json tvbox-cn-fast.json tvbox-stable7.json; do
+            if [ ! -f "$f" ]; then
+              echo "::error::缺少必需产物 $f"
+              exit 1
+            fi
+          done
+          # 逐文件 git add -f：一条 git add 里只要有一个 pathspec 不存在，git 会
+          # 整体失败且不暂存任何文件；以前用 2>/dev/null || true 把错误吞掉，
+          # 当天全部配置/历史会静默不提交。生成物可能缺失（首日/探测失败），
+          # 所以先判断存在再单独 add。
+          for f in tvbox.json tvbox-lite.json tvbox-network.json tvbox-home.json \
+                   tvbox-full-homefirst.json tvbox-lite-homefirst.json \
+                   tvbox-network-homefirst.json \
+                   tvbox-quality.json tvbox-cn-fast.json tvbox-stable7.json \
+                   home-sites.txt quality.json history/ live-henan.m3u \
+                   reports/audit-latest.md reports/regression-latest.md \
+                   reports/assertions.json reports/regression.json \
+                   reports/build-status.json reports/live-audit.json; do
+            if [ -e "$f" ]; then git add -f "$f"; fi
+          done
+          # 本轮没生成的每日结论必须从索引移除：只判断 -e 不 add，HEAD 里
+          # 仍留着昨天的报告，外部查仓库会被误导，下一轮 checkout 又带出来。
+          for f in reports/assertions.json reports/regression.json \
+                   reports/build-status.json reports/live-audit.json \
+                   reports/audit-latest.md \
+                   reports/regression-latest.md; do
+            if [ ! -e "$f" ]; then git rm --cached --ignore-unmatch "$f"; fi
+          done
+          if git diff --cached --quiet; then
+            echo "配置与历史无变化，跳过本次提交"
+            echo "changed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: 更新聚合配置 $(date -u +%Y-%m-%d)"
+          echo "changed=true" >> $GITHUB_OUTPUT
+
+      # stable.py 用 git rev-parse HEAD 把不可变 tag 指向本轮提交、并把该 SHA
+      # 写进 stable.json。若只在推送前才 rebase，并发提交会重写本地 SHA，
+      # tag 与 stable.json.commit 就指向一个不在 main 历史里的孤儿提交。
+      - name: 同步远端（稳定版 tag 创建前）
+        run: |
+          git pull --rebase origin main || {
+            echo "::error::与远端并发提交冲突，rebase 失败；放弃本轮以免 tag 指向旧提交"
+            git rebase --abort
+            exit 1
+          }
+
+      - name: 归档 + 稳定版指针 + 不可变 tag
+        run: python scripts/stable.py --min-streak 3 --keep-days 7
+
+      # ── 4. 可观测性 ─────────────────────────────────────────────
+      - name: 生成健康页与 Pages 配置镜像
+        run: python scripts/health.py
+
+      # 结构校验：曾把 </table> 写进 for 循环体，线上健康页只显示第一行数据。
+      # 部署前硬校验，坏页面绝不上 Pages。
+      # 除表格闭合外，还要确认 Pages 发的是本轮配置、三份结论不是旧副本、
+      # 且页面里没有指向缺失报告的死链（结论被清除时页面会给「本轮未生成」）。
+      - name: 健康页结构校验
+        run: |
+          python - <<'PY'
+          import os, re, sys
+          sys.path.insert(0, "scripts")
+          import health as H
+
+          page = open("site/index.html", encoding="utf-8").read()
+          a, b = page.count("<table>"), page.count("</table>")
+          print("健康页表格：%d 个开标签 / %d 个闭合" % (a, b))
+          errs = []
+          if not a or a != b:
+              errs.append("表格标签不平衡")
+
+          def same(x, y):
+              return os.path.exists(y) and open(x, "rb").read() == open(y, "rb").read()
+
+          for f, _, _ in H.FILES:
+              if not same(f, os.path.join("site", f)):
+                  errs.append("Pages 配置缺失或陈旧：" + f)
+          for f in ("assertions.json", "regression.json", "build-status.json"):
+              src, dst = os.path.join("reports", f), os.path.join("site", f)
+              if os.path.exists(src):
+                  if not same(src, dst):
+                      errs.append("Pages 结论缺失或陈旧：" + f)
+              elif os.path.exists(dst):
+                  errs.append("本轮未生成却仍在发布：" + f)
+          for href in re.findall(r"href='([^']+)'", page):
+              if href.startswith(("http", "#")):
+                  continue
+              if not os.path.exists(os.path.join("site", href)):
+                  errs.append("健康页死链：" + href)
+          for e in errs:
+              print("::error::" + e)
+          print("Pages 一致性校验：%s" % ("通过" if not errs else "%d 处问题" % len(errs)))
+          sys.exit(1 if errs else 0)
+          PY
+
+      - name: 上传 Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+      - name: 提交归档、指针与健康数据
+        run: |
+          for f in archive/ stable.json health.json; do
+            if [ -e "$f" ]; then git add -f "$f"; fi
+          done
+          if git diff --cached --quiet; then
+            echo "归档与指针无变化"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: 归档与稳定版指针 $(date -u +%Y-%m-%d)"
+
+      - name: 推送（含不可变稳定版 tag）
+        run: |
+          # discover 工作流或手动触发可能在本作业运行期间插进提交，直接 push
+          # 会被 non-fast-forward 拒掉、build 变红且 pages 作业被跳过。
+          git pull --rebase origin main || {
+            echo "::error::与远端并发提交冲突，rebase 失败；放弃本次推送以免部署陈旧产物"
+            git rebase --abort
+            exit 1
+          }
+          # tag 必须先推：以前是 push main 之后 `git push --tags || echo warning`，
+          # tag 推送失败被吞掉，但 stable.json 已随 main 发布并指向一个线上不存在
+          # 的新 tag，固定直链直接 404。tag 失败就整步失败、main 也不推，线上
+          # 保持上一版，仓库里的 stable.json 仍指向确实存在的旧 tag。
+          git push --tags
+          git push
+
+      # ── 5. CDN 缓存治理 ─────────────────────────────────────────
+      # jsDelivr 对分支引用 s-maxage=43200（12h）且不感知 commit 变化。
+      # 实测：purge 接口返回 finished，cdn 上仍是上一版 —— 用户复制的是主线
+      # 链接，改了拿不到等于没改。所以改成 purge 之后把文件取回来比对 sha256，
+      # 不一致就再 purge（最多 3 轮），并把结果写进 _cdn_purge.json。
+      - name: 刷新 jsDelivr CDN 缓存并校验
+        run: |
+          echo "本次是否有提交: ${{ steps.commit.outputs.changed }}"
+          python scripts/purge_cdn.py --attempts 3 || echo "CDN 刷新失败（非致命）"
+          exit 0
+
+      # purge 结果此前只躺在 CI 日志里（_cdn_purge.json 被 _*.json 忽略且无人
+      # 提交）。提交到仓库，用户与 regression.py --online 都能查到当日线路状态。
+      - name: 提交 CDN 刷新记录
+        run: |
+          if [ -f _cdn_purge.json ]; then
+            git add -f _cdn_purge.json
+            if git diff --cached --quiet; then
+              echo "CDN 记录无变化"
+              exit 0
+            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: CDN 刷新记录 $(date -u +%Y-%m-%d)"
+            # 这条记录只是可观测性数据，冲突就跳过，不要影响已经上传的 Pages artifact
+            git pull --rebase origin main || {
+              echo "::warning::CDN 记录 rebase 冲突，跳过本次记录推送"
+              git rebase --abort
+              exit 0
+            }
+            git push || echo "::warning::CDN 刷新记录推送失败（不影响 Pages 产物）"
+          fi
+
+  # 短 TTL 备用线路 + 健康页。Pages 的缓存远短于 jsDelivr，且不受 purge 影响。
+  pages:
+    needs: build
+    if: success()
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 部署 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
